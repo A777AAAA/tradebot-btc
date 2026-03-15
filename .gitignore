@@ -1,0 +1,21 @@
+# Игнорируем бинарные файлы и данные
+*.pkl
+*.csv
+*.png
+*.log
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+__pycache__/
+*.pyc
+.DS_Store
+atr_mean.pkl
+historical_data.csv
+ml_ready_ton_data.csv
+ml_ready_ton_data_v2.csv
+okx_ton_data.csv
+trading_log.csv
+Figure_1.png
+ai_brain.pkl
+enhanced_ton_data.csv

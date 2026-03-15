@@ -1,0 +1,10 @@
+flask
+ccxt
+pandas
+pandas-ta==0.4.71b0
+scikit-learn
+imbalanced-learn
+joblib
+huggingface_hub
+requests
+mailtrap

@@ -18,13 +18,19 @@ def get_4h_features(symbol='TON/USDT', limit=100):
     Скачивает 4-часовые свечи, рассчитывает индикаторы и возвращает DataFrame
     с индексом timestamp и колонками признаков.
     """
+    logging.info("Начинаем получение 4h данных...")
     try:
-        exchange = ccxt.okx()
+        exchange = ccxt.okx({'timeout': 30000})  # таймаут 30 секунд
+        logging.info("Создан объект exchange, отправляем запрос к OKX...")
         ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=limit)
+        logging.info(f"Получено {len(ohlcv_4h)} свечей 4h")
+        
         df_4h = pd.DataFrame(ohlcv_4h, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df_4h['Timestamp'] = pd.to_datetime(df_4h['Timestamp'], unit='ms')
         df_4h.set_index('Timestamp', inplace=True)
+        logging.info("DataFrame 4h создан")
 
+        logging.info("Расчёт индикаторов на 4h...")
         df_4h['EMA50_4h'] = ta.ema(df_4h['Close'], length=50)
         df_4h['RSI_4h'] = ta.rsi(df_4h['Close'], length=14)
         df_4h['ATR_4h'] = ta.atr(df_4h['High'], df_4h['Low'], df_4h['Close'], length=14)
@@ -37,13 +43,21 @@ def get_4h_features(symbol='TON/USDT', limit=100):
                 break
         if macdh_col is None:
             df_4h['MACD_Hist_4h'] = 0.0
+            logging.warning("Колонка MACDh не найдена, используется 0")
         else:
             df_4h['MACD_Hist_4h'] = macd_4h[macdh_col]
 
         df_4h.dropna(inplace=True)
+        logging.info(f"Индикаторы рассчитаны, осталось {len(df_4h)} записей после dropna")
         return df_4h[['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h']]
+    except ccxt.RequestTimeout as e:
+        logging.error(f"Таймаут при запросе к OKX: {e}")
+        return pd.DataFrame(columns=['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'])
+    except ccxt.NetworkError as e:
+        logging.error(f"Сетевая ошибка при запросе к OKX: {e}")
+        return pd.DataFrame(columns=['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'])
     except Exception as e:
-        logging.error(f"Ошибка получения 4h данных: {e}")
+        logging.error(f"Неизвестная ошибка получения 4h данных: {e}")
         return pd.DataFrame(columns=['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'])
 
 def get_signal():
@@ -105,9 +119,11 @@ def get_signal():
         df_4h_relevant = df_4h[df_4h.index <= last_1h_time]
         if not df_4h_relevant.empty:
             last_4h_features = df_4h_relevant.iloc[-1]
+            logging.info("✅ 4h признаки получены и сопоставлены")
         else:
+            # Если нет 4h свечи до последней 1h, берём самую последнюю 4h свечу (она может быть будущей, но это fallback)
             last_4h_features = df_4h.iloc[-1]
-        logging.info("✅ 4h признаки получены и сопоставлены")
+            logging.warning("⚠️ Нет 4h свечи до последней 1h, используем последнюю доступную 4h свечу")
     else:
         last_4h_features = pd.Series([0.0, 0.0, 0.0, 0.0],
                                       index=['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'])

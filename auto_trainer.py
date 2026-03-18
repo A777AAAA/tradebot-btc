@@ -69,20 +69,17 @@ def get_4h_features(symbol='TON/USDT', limit=500):
     
     # Расчёт MACD и поиск колонки гистограммы
     macd_4h = ta.macd(df_4h['Close'])
-    # Ищем колонку, содержащую 'MACDh' (гистограмма)
     macdh_col = None
     for col in macd_4h.columns:
         if 'MACDh' in col.upper():
             macdh_col = col
             break
     if macdh_col is None:
-        # Если не нашли, возможно другое имя; создадим нулевой столбец (fallback)
         print("⚠️ Не найдена колонка MACDh в 4h данных, будет заполнена 0.")
         df_4h['MACD_Hist_4h'] = 0.0
     else:
         df_4h['MACD_Hist_4h'] = macd_4h[macdh_col]
     
-    # Удаляем строки с NaN (первые, где индикатор не посчитался)
     df_4h.dropna(inplace=True)
     if df_4h.empty:
         print("⚠️ 4h DataFrame пуст после удаления NaN. Возвращаем пустой DataFrame.")
@@ -97,6 +94,13 @@ def update_and_train():
     if os.path.exists(file_name):
         df_old = pd.read_csv(file_name, index_col='Timestamp', parse_dates=True)
         print(f"📊 Найдена база: {len(df_old)} записей.")
+        
+        # Удаляем старые 4h колонки, если они есть, чтобы избежать дублирования при merge_asof
+        cols_to_drop = ['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h']
+        existing_cols = [col for col in cols_to_drop if col in df_old.columns]
+        if existing_cols:
+            df_old = df_old.drop(columns=existing_cols)
+            print(f"🧹 Удалены устаревшие 4h колонки: {existing_cols}")
     else:
         print("⚠️ Старая база не найдена, начинаем с нуля.")
         df_old = pd.DataFrame()
@@ -126,7 +130,7 @@ def update_and_train():
         df_combined_sorted = df_combined.sort_index()
         df_4h_sorted = df_4h_features.sort_index()
         
-        # --- ИСПРАВЛЕНИЕ: приводим индексы к единому типу (datetime64[ns]) ---
+        # Приводим индексы к единому типу (datetime64[ns])
         df_combined_sorted.index = df_combined_sorted.index.astype('datetime64[ns]')
         df_4h_sorted.index = df_4h_sorted.index.astype('datetime64[ns]')
         
@@ -176,16 +180,26 @@ def update_and_train():
         'RSI', 'ATR', 'BB_Dist_Lower', 'MACD_Hist', 'Vol_Change', 'Price_Change_3h',
         'EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'
     ]
-    # Убедимся, что все колонки присутствуют (если 4h отсутствовали, они уже добавлены как NaN)
+    
+    # Проверяем наличие всех колонок
+    missing_cols = [col for col in features if col not in df_clean.columns]
+    if missing_cols:
+        print(f"⚠️ Внимание! Отсутствуют колонки: {missing_cols}. Добавляем их с нулями.")
+        for col in missing_cols:
+            df_clean[col] = 0.0
+    else:
+        print("✅ Все необходимые колонки присутствуют.")
+    
     X = df_clean[features]
     y = df_clean['Target']
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
+    # Применяем SMOTE для балансировки классов
     sm = SMOTE(random_state=42)
     X_res, y_res = sm.fit_resample(X_train, y_train)
 
-    # Блок автотюнинга
+    # Загружаем метаданные для проверки даты тюнинга
     try:
         old_model, metadata = load_model_from_hub()
         print("✅ Модель загружена из Hub.")
@@ -231,18 +245,28 @@ def update_and_train():
                 random_state=42,
                 n_jobs=-1
             )
+        # Обучаем модель на сбалансированных данных
         model.fit(X_res, y_res)
 
+    # Оцениваем точность на тестовых данных
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
     print(f"🎯 Точность модели: {acc:.4f}")
 
+    # Обновляем метаданные
     metadata['last_training'] = today.isoformat()
     metadata['accuracy'] = f"{acc:.4f}"
+    
+    # Сохраняем среднее ATR для риск-менеджмента
+    atr_mean_value = float(df_clean['ATR'].mean())
+    metadata['atr_mean'] = atr_mean_value
+    print(f"📊 Средний ATR сохранен в метаданных: {atr_mean_value:.4f}")
 
+    # Сохраняем модель и метаданные в Hub
     save_model_to_hub(model, metadata)
     print(f"🚀 Модель сохранена в Hub! Точность: {acc:.4f}")
 
+    # Локальное сохранение (опционально)
     joblib.dump(df_clean['ATR'].mean(), 'atr_mean.pkl')
     print("💾 Локальные файлы обновлены. Система готова!")
 

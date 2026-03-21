@@ -259,7 +259,11 @@ def get_live_signal():
     if pred is None:
         return None
 
-    signal = "BUY" if pred == 1 else "HOLD"
+    signal = "BUY" if pred == 1 else "SELL" if pred == 0 else "HOLD"
+
+    # Для SELL используем обратную вероятность
+    if pred == 0:
+        prob = 1.0 - prob
 
     return {
         "signal":     signal,

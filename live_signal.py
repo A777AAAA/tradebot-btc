@@ -207,3 +207,33 @@ if __name__ == "__main__":
     p, pr = get_signal()
     if p is not None:
         print(f"{'📈 ПОКУПКА' if p == 1 else '📉 НЕТ СИГНАЛА'} | Вероятность: {pr:.2%}")
+
+def get_live_signal():
+    """Обёртка для app.py — возвращает словарь вместо tuple"""
+    try:
+        exchange = ccxt.okx()
+        ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=5)
+        current_price = ohlcv[-1][4]  # Close последней свечи
+        change_24h_ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1d', limit=2)
+        change_24h = (change_24h_ohlcv[-1][4] - change_24h_ohlcv[-2][4]) / change_24h_ohlcv[-2][4] * 100
+        volume = change_24h_ohlcv[-1][5]
+    except Exception as e:
+        logging.error(f"Ошибка получения цены: {e}")
+        current_price = 0.0
+        change_24h = 0.0
+        volume = 0.0
+
+    pred, prob = get_signal()
+
+    if pred is None:
+        return None
+
+    signal = "BUY" if pred == 1 else "HOLD"
+
+    return {
+        "signal":     signal,
+        "confidence": float(prob),
+        "price":      current_price,
+        "change_24h": change_24h,
+        "volume":     volume
+    }

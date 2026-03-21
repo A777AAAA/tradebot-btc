@@ -10,3 +10,4 @@ gspread==6.1.2
 google-auth==2.29.0
 schedule==1.2.2
 python-telegram-bot==20.8
+pandas_ta

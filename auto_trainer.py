@@ -1,8 +1,5 @@
 """
 auto_trainer.py — Переобучение модели каждые 6 часов.
-Учитывает:
-  • Историю OKX (2000 свечей)
-  • Результаты виртуальных сделок (paper_trades.json)
 """
 
 import os
@@ -10,6 +7,7 @@ import json
 import joblib
 import logging
 import requests
+import time
 import numpy as np
 import pandas as pd
 
@@ -29,17 +27,42 @@ logging.basicConfig(
 
 
 # ─────────────────────────────────────────────
-# 1. Загрузка исторических данных с OKX (без ccxt)
+# 1. Загрузка данных — несколько запросов по 300 свечей
 # ─────────────────────────────────────────────
 def fetch_ohlcv(symbol="TON-USDT", timeframe="1H", limit=2000) -> pd.DataFrame:
+    """OKX отдаёт max 300 свечей за раз — делаем несколько запросов"""
     try:
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
-        r    = requests.get(url, timeout=15)
-        data = r.json().get("data", [])
-        if not data:
+        all_data = []
+        after = None
+        fetched = 0
+        max_requests = 10
+
+        for i in range(max_requests):
+            url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar={timeframe}&limit=300"
+            if after:
+                url += f"&after={after}"
+
+            r    = requests.get(url, timeout=15)
+            data = r.json().get("data", [])
+
+            if not data:
+                break
+
+            all_data.extend(data)
+            fetched += len(data)
+
+            if fetched >= limit:
+                break
+
+            # after = timestamp самой старой свечи для следующего запроса
+            after = data[-1][0]
+            time.sleep(0.3)
+
+        if not all_data:
             logging.error("[Trainer] ❌ Пустой ответ от OKX")
             return pd.DataFrame()
-        df = pd.DataFrame(data, columns=[
+
+        df = pd.DataFrame(all_data, columns=[
             'ts','Open','High','Low','Close','Volume','VolCcy','VolCcyQuote','Confirm'
         ])
         df = df[['ts','Open','High','Low','Close','Volume']].copy()
@@ -48,8 +71,11 @@ def fetch_ohlcv(symbol="TON-USDT", timeframe="1H", limit=2000) -> pd.DataFrame:
         for col in ['Open','High','Low','Close','Volume']:
             df[col] = df[col].astype(float)
         df = df.sort_index()
+        df = df[~df.index.duplicated(keep='first')]
+
         logging.info(f"[Trainer] ✅ Загружено {len(df)} свечей с OKX")
         return df
+
     except Exception as e:
         logging.error(f"[Trainer] ❌ Ошибка загрузки OKX: {e}")
         return pd.DataFrame()
@@ -91,7 +117,7 @@ def calc_adx(df, period=14):
     plus_dm  = up.where((up > down) & (up > 0),    0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
     atr      = calc_atr(df, period)
-    plus_di  = 100 * (plus_dm.ewm(com=period-1,  min_periods=period).mean() / atr)
+    plus_di  = 100 * (plus_dm.ewm(com=period-1, min_periods=period).mean() / atr)
     minus_di = 100 * (minus_dm.ewm(com=period-1, min_periods=period).mean() / atr)
     dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     adx = dx.ewm(com=period - 1, min_periods=period).mean()
@@ -127,18 +153,20 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df['EMA_ratio'] = df['EMA20'] / df['EMA50']
     df['Vol_ratio'] = calc_volume_ratio(df)
     df['Body_pct']   = (df['Close'] - df['Open']).abs() / df['Open'] * 100
-    df['Upper_wick'] = (df['High'] - df[['Close', 'Open']].max(axis=1)) / df['Open'] * 100
-    df['Lower_wick'] = (df[['Close', 'Open']].min(axis=1) - df['Low']) / df['Open'] * 100
+    df['Upper_wick'] = (df['High'] - df[['Close','Open']].max(axis=1)) / df['Open'] * 100
+    df['Lower_wick'] = (df[['Close','Open']].min(axis=1) - df['Low']) / df['Open'] * 100
     df['Return_1h']  = df['Close'].pct_change(1)  * 100
     df['Return_4h']  = df['Close'].pct_change(4)  * 100
     df['Return_12h'] = df['Close'].pct_change(12) * 100
     df['Return_24h'] = df['Close'].pct_change(24) * 100
-    df['Target'] = (df['Close'].shift(-8) > df['Close'] * 1.015).astype(int)
+
+    # ✅ Цель: рост на 1.5% за 8 часов (снижено с 1.5% для большего числа сигналов)
+    df['Target'] = (df['Close'].shift(-8) > df['Close'] * 1.01).astype(int)
     return df.dropna()
 
 
 # ─────────────────────────────────────────────
-# 3. Загрузка результатов Paper Trading
+# 3. Paper Trading результаты
 # ─────────────────────────────────────────────
 def load_paper_results() -> pd.DataFrame:
     if not os.path.exists(PAPER_FILE):
@@ -158,14 +186,9 @@ def load_paper_results() -> pd.DataFrame:
             "pnl_pct":    t.get("pnl_pct", 0),
             "Target":     1 if t["result"] == "WIN" else 0,
         })
-    df     = pd.DataFrame(rows)
-    wins   = df['Target'].sum()
-    losses = len(df) - wins
-    logging.info(
-        f"[Trainer] 📊 Paper results: "
-        f"{len(df)} сделок | WIN: {wins} | LOSS: {losses} | "
-        f"Winrate: {wins/len(df)*100:.1f}%"
-    )
+    df   = pd.DataFrame(rows)
+    wins = df['Target'].sum()
+    logging.info(f"[Trainer] 📊 Paper: {len(df)} сделок | Winrate: {wins/len(df)*100:.1f}%")
     return df
 
 
@@ -184,7 +207,6 @@ FEATURE_COLS = [
 
 
 def _json_safe(obj):
-    """Конвертирует numpy/float32 типы в стандартные Python типы для JSON"""
     if hasattr(obj, 'item'):
         return obj.item()
     return str(obj)
@@ -201,6 +223,11 @@ def train_model(symbol="TON-USDT") -> dict:
     if len(df) < 100:
         return {"success": False, "error": "Мало данных после обработки"}
 
+    # Логируем баланс классов
+    pos = df['Target'].sum()
+    neg = len(df) - pos
+    logging.info(f"[Trainer] 📊 Баланс: BUY={pos} ({pos/len(df)*100:.1f}%) / HOLD={neg}")
+
     X = df[FEATURE_COLS].values
     y = df['Target'].values
 
@@ -210,23 +237,24 @@ def train_model(symbol="TON-USDT") -> dict:
     if not paper_df.empty:
         paper_winrate = paper_df['Target'].mean()
         if paper_winrate < 0.45:
-            logging.info(f"[Trainer] ⚠️ Winrate {paper_winrate:.1%} < 45% — усиливаем примеры LOSS")
             sample_weights[y == 0] *= 1.5
-        elif paper_winrate > 0.65:
-            logging.info(f"[Trainer] ✅ Winrate {paper_winrate:.1%} > 65% — модель хорошая")
 
     X_train, X_test, y_train, y_test, w_train, _ = train_test_split(
         X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False
     )
 
+    # scale_pos_weight балансирует классы автоматически
+    scale = neg / pos if pos > 0 else 1.0
+
     model = XGBClassifier(
         n_estimators     = 300,
-        max_depth        = 5,
+        max_depth        = 4,
         learning_rate    = 0.05,
         subsample        = 0.8,
         colsample_bytree = 0.8,
-        min_child_weight = 3,
-        gamma            = 0.1,
+        min_child_weight = 2,
+        gamma            = 0.05,
+        scale_pos_weight = scale,
         use_label_encoder= False,
         eval_metric      = 'logloss',
         random_state     = 42,
@@ -268,13 +296,9 @@ def train_model(symbol="TON-USDT") -> dict:
         f"[Trainer] ✅ Модель обучена: "
         f"Accuracy={accuracy:.1%} | Precision={precision:.1%} | Recall={recall:.1%}"
     )
-    logging.info(f"[Trainer] 🏆 Топ признаки: {top_features[:3]}")
     return stats
 
 
-# ─────────────────────────────────────────────
-# 5. Загрузка модели
-# ─────────────────────────────────────────────
 def load_model():
     if not os.path.exists(MODEL_FILE):
         logging.info("[Trainer] 🆕 Модели нет — начинаем обучение...")
@@ -286,19 +310,8 @@ def load_model():
 
 if __name__ == "__main__":
     result = train_model()
-    print(f"\n{'='*50}")
-    print(f"  Результат обучения:")
-    print(f"{'='*50}")
     if result.get("success"):
-        print(f"  Точность:     {result['accuracy']:.1%}")
-        print(f"  Precision:    {result['precision']:.1%}")
-        print(f"  Recall:       {result['recall']:.1%}")
-        print(f"  Примеров:     {result['n_samples']}")
-        print(f"  Paper сделок: {result['paper_trades']}")
-        print(f"\n  Топ признаки:")
-        for name, importance in result['top_features']:
-            bar = "█" * int(importance * 50)
-            print(f"  {name:<20} {bar} {importance:.3f}")
+        print(f"Accuracy={result['accuracy']:.1%} | Precision={result['precision']:.1%} | Recall={result['recall']:.1%}")
+        print(f"Примеров: {result['n_samples']}")
     else:
-        print(f"  ❌ Ошибка: {result.get('error')}")
-    print(f"{'='*50}")
+        print(f"❌ {result.get('error')}")

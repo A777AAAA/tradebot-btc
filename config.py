@@ -46,7 +46,7 @@ RETRAIN_HOUR  = int(os.getenv("RETRAIN_HOUR", "2"))
 # ═══════════════════════════════════════════
 # ПОРОГИ СИГНАЛОВ
 # ═══════════════════════════════════════════
-MIN_CONFIDENCE = 0.62
+MIN_CONFIDENCE = 0.51
 STRONG_SIGNAL  = 0.75
 
 

@@ -161,7 +161,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df['Return_24h'] = df['Close'].pct_change(24) * 100
 
     # ✅ Цель: рост на 1.5% за 8 часов (снижено с 1.5% для большего числа сигналов)
-    df['Target'] = (df['Close'].shift(-8) > df['Close'] * 1.01).astype(int)
+    df['Target'] = (df['Close'].shift(-8) > df['Close'] * 1.005).astype(int)
     return df.dropna()
 
 

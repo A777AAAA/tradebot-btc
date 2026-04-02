@@ -9,7 +9,6 @@ import pandas as pd
 from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score
-from datetime import datetime
 
 MODEL_FILE = "ai_brain.pkl"
 STATS_FILE = "training_stats.json"
@@ -20,14 +19,15 @@ FEATURE_COLS = [
     'RSI_14', 'RSI_7', 'MACD', 'MACD_signal', 'MACD_hist',
     'ATR_pct', 'ADX', 'BB_pos', 'EMA_ratio', 'Vol_ratio',
     'Body_pct', 'Upper_wick', 'Lower_wick',
-    'Return_1h', 'Return_4h', 'Return_12h', 'Return_24h'
+    'Return_1h', 'Return_4h', 'Return_12h', 'Return_24h',
+    'Hour' # Добавили время
 ]
 
-def fetch_ohlcv(symbol="TON-USDT", limit=2000):
+def fetch_ohlcv(symbol="TON-USDT"):
     all_data = []
     after = None
     try:
-        for _ in range(7):
+        for _ in range(8):
             url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=1H&limit=300"
             if after: url += f"&after={after}"
             r = requests.get(url, timeout=15).json()
@@ -45,6 +45,7 @@ def fetch_ohlcv(symbol="TON-USDT", limit=2000):
 
 def calc_indicators(df):
     d = df.copy()
+    d['Hour'] = d.index.hour # Бот будет знать, какое сейчас время
     for p in [7, 14]:
         diff = d['Close'].diff()
         g = diff.clip(lower=0); l = -diff.clip(upper=0)
@@ -60,7 +61,7 @@ def calc_indicators(df):
     atr = tr.ewm(com=13, min_periods=14).mean()
     d['ATR_pct'] = (atr / d['Close']) * 100
     sma20 = d['Close'].rolling(20).mean(); std20 = d['Close'].rolling(20).std()
-    d['BB_pos'] = (d['Close'] - (sma20 - 2*std20)) / (4*std20)
+    d['BB_pos'] = (d['Close'] - (sma20 - 2*std20)) / (4*std20 + 1e-6)
     d['EMA_ratio'] = d['Close'].ewm(span=20).mean() / d['Close'].ewm(span=50).mean()
     d['Vol_ratio'] = d['Volume'] / d['Volume'].rolling(20).mean()
     d['Body_pct'] = (d['Close'] - d['Open']).abs() / d['Open'] * 100
@@ -78,17 +79,23 @@ def train_model():
     if df_raw.empty: return {"success": False, "error": "No data"}
     df = calc_indicators(df_raw)
     
-    # ЦЕЛЬ: Рост 1.0% за 8 часов
-    df['Target'] = (df['Close'].shift(-8) > df['Close'] * 1.010).astype(int)
+    # Теперь учим бота и росту, и падению
+    # 1 - BUY (рост > 1%), 2 - SELL (падение > 1%), 0 - HOLD
+    df['Target'] = 0
+    df.loc[df['Close'].shift(-8) > df['Close'] * 1.010, 'Target'] = 1
+    df.loc[df['Close'].shift(-8) < df['Close'] * 0.990, 'Target'] = 2
     
     X = df[FEATURE_COLS].values
     y = df['Target'].values
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
     
-    pos = np.sum(y_train == 1); neg = np.sum(y_train == 0)
-    scale = (neg / pos) * 2.0 if pos > 0 else 1.0
-
-    model = XGBClassifier(n_estimators=300, max_depth=5, learning_rate=0.03, scale_pos_weight=scale, eval_metric='logloss', gamma=0.1)
+    model = XGBClassifier(
+        n_estimators=300, 
+        max_depth=5, 
+        learning_rate=0.03, 
+        eval_metric='mlogloss', # Для многоклассовой классификации
+        num_class=3
+    )
     model.fit(X_train, y_train)
     
     y_pred = model.predict(X_test)
@@ -96,12 +103,8 @@ def train_model():
     
     stats = {
         "accuracy": accuracy_score(y_test, y_pred),
-        "precision": precision_score(y_test, y_pred, zero_division=0),
-        "recall": recall_score(y_test, y_pred, zero_division=0),
-        "n_samples": len(df),
-        "success": True,
-        "paper_trades": 0,
-        "top_features": []
+        "precision": precision_score(y_test, y_pred, average='weighted', zero_division=0),
+        "success": True, "n_samples": len(df)
     }
     with open(STATS_FILE, "w") as f: json.dump(stats, f)
     return stats

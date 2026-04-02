@@ -3,20 +3,20 @@ import pandas as pd
 import logging
 import joblib
 import os
-from config import OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from datetime import datetime
 
 MODEL_PATH = "ai_brain.pkl"
 FEATURE_COLS = [
     'RSI_14', 'RSI_7', 'MACD', 'MACD_signal', 'MACD_hist',
     'ATR_pct', 'ADX', 'BB_pos', 'EMA_ratio', 'Vol_ratio',
     'Body_pct', 'Upper_wick', 'Lower_wick',
-    'Return_1h', 'Return_4h', 'Return_12h', 'Return_24h'
+    'Return_1h', 'Return_4h', 'Return_12h', 'Return_24h',
+    'Hour'
 ]
 
 def calc_live_indicators(df):
     d = df.copy()
+    d['Hour'] = d.index.hour
     for p in [7, 14]:
         diff = d['Close'].diff()
         g = diff.clip(lower=0); l = -diff.clip(upper=0)
@@ -32,7 +32,7 @@ def calc_live_indicators(df):
     atr = tr.ewm(com=13, min_periods=14).mean()
     d['ATR_pct'] = (atr / d['Close']) * 100
     sma20 = d['Close'].rolling(20).mean(); std20 = d['Close'].rolling(20).std()
-    d['BB_pos'] = (d['Close'] - (sma20 - 2*std20)) / (4*std20)
+    d['BB_pos'] = (d['Close'] - (sma20 - 2*std20)) / (4*std20 + 1e-6)
     d['EMA_ratio'] = d['Close'].ewm(span=20).mean() / d['Close'].ewm(span=50).mean()
     d['Vol_ratio'] = d['Volume'] / d['Volume'].rolling(20).mean()
     d['Body_pct'] = (d['Close'] - d['Open']).abs() / d['Open'] * 100
@@ -53,22 +53,30 @@ def get_live_signal():
         exchange = ccxt.okx({'options': {'defaultType': 'spot'}})
         ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=100)
         df = pd.DataFrame(ohlcv, columns=['ts','Open','High','Low','Close','Volume'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        df.set_index('ts', inplace=True)
         df[['Open','High','Low','Close','Volume']] = df[['Open','High','Low','Close','Volume']].astype(float)
         
         df_feats = calc_live_indicators(df)
         X = df_feats[FEATURE_COLS].iloc[-1:].values
         
-        prob = float(model.predict_proba(X)[0][1])
+        pred = model.predict(X)[0] # 0=HOLD, 1=BUY, 2=SELL
+        probs = model.predict_proba(X)[0]
+        
+        confidence = float(max(probs))
         cur_price = df['Close'].iloc[-1]
-        change_24h = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
+        
+        res_signal = "HOLD"
+        if pred == 1: res_signal = "BUY"
+        if pred == 2: res_signal = "SELL"
         
         return {
-            "signal": "BUY" if prob > 0.5 else "HOLD",
-            "confidence": prob,
+            "signal": res_signal,
+            "confidence": confidence,
             "price": cur_price,
-            "change_24h": change_24h,
+            "change_24h": 0.0, # Упростили
             "volume": float(df['Volume'].iloc[-1])
         }
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"Signal Error: {e}")
         return None

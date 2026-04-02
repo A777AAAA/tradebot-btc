@@ -117,7 +117,7 @@ def trading_loop():
 
             # ── Шаг 3: Открытие Paper сделки ───────────────
             logger.info("🔍 Шаг 3: проверка сигнала")
-            if signal in ("BUY", "SELL") and confidence >= MIN_CONFIDENCE:
+            if signal in ("BUY", "SELL") and confidence >= MIN_CONFIDENCE and signal != "HOLD":
 
                 change_24h    = signal_data.get("change_24h", 0.0)
                 volume        = signal_data.get("volume",     0.0)

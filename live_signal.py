@@ -1,11 +1,9 @@
 import ccxt
 import pandas as pd
 import logging
-import numpy as np
 import joblib
 import os
-from datetime import datetime
-from telegram_notify import send_message
+from config import OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -17,16 +15,13 @@ FEATURE_COLS = [
     'Return_1h', 'Return_4h', 'Return_12h', 'Return_24h'
 ]
 
-OKX_CONFIG = {'options': {'defaultType': 'spot'}, 'timeout': 30000}
-
 def calc_live_indicators(df):
-    # Копия логики из auto_trainer.py
     d = df.copy()
     for p in [7, 14]:
         diff = d['Close'].diff()
-        gain = diff.clip(lower=0); loss = -diff.clip(upper=0)
-        avg_g = gain.ewm(com=p-1, min_periods=p).mean()
-        avg_l = loss.ewm(com=p-1, min_periods=p).mean()
+        g = diff.clip(lower=0); l = -diff.clip(upper=0)
+        avg_g = g.ewm(com=p-1, min_periods=p).mean()
+        avg_l = l.ewm(com=p-1, min_periods=p).mean()
         d[f'RSI_{p}'] = 100 - (100 / (1 + avg_g/avg_l))
     ema12 = d['Close'].ewm(span=12, adjust=False).mean()
     ema26 = d['Close'].ewm(span=26, adjust=False).mean()
@@ -46,8 +41,7 @@ def calc_live_indicators(df):
     for h in [1, 4, 12, 24]: d[f'Return_{h}h'] = d['Close'].pct_change(h) * 100
     up = d['High'].diff(); down = -d['Low'].diff()
     pdm = up.where((up>down)&(up>0), 0); mdm = down.where((down>up)&(down>0), 0)
-    pdi = 100 * (pdm.ewm(alpha=1/14).mean() / atr)
-    mdi = 100 * (mdm.ewm(alpha=1/14).mean() / atr)
+    pdi = 100 * (pdm.ewm(alpha=1/14).mean() / atr); mdi = 100 * (mdm.ewm(alpha=1/14).mean() / atr)
     dx = 100 * (pdi-mdi).abs() / (pdi+mdi); d['ADX'] = dx.ewm(alpha=1/14).mean()
     return d.dropna()
 
@@ -56,7 +50,7 @@ def get_live_signal():
         if not os.path.exists(MODEL_PATH): return None
         model = joblib.load(MODEL_PATH)
         
-        exchange = ccxt.okx(OKX_CONFIG)
+        exchange = ccxt.okx({'options': {'defaultType': 'spot'}})
         ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=100)
         df = pd.DataFrame(ohlcv, columns=['ts','Open','High','Low','Close','Volume'])
         df[['Open','High','Low','Close','Volume']] = df[['Open','High','Low','Close','Volume']].astype(float)
@@ -66,8 +60,6 @@ def get_live_signal():
         
         prob = float(model.predict_proba(X)[0][1])
         cur_price = df['Close'].iloc[-1]
-        
-        # Данные для анализа настроения
         change_24h = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
         
         return {
@@ -78,5 +70,5 @@ def get_live_signal():
             "volume": float(df['Volume'].iloc[-1])
         }
     except Exception as e:
-        logging.error(f"Error in get_live_signal: {e}")
+        logging.error(f"Error: {e}")
         return None

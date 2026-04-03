@@ -1,12 +1,18 @@
 """
-live_signal.py v6.0 — Двойные бинарные классификаторы + Meta-Labeling
-АРХИТЕКТУРА:
-  Layer 1 — BUY-модель:  XGB_buy + LGBM_buy  -> p_buy  = avg(...)
-  Layer 1 — SELL-модель: XGB_sell + LGBM_sell -> p_sell = avg(...)
-  Layer 2 — Meta-filter: meta_model_buy.pkl   -> доп. фильтр для BUY
-  Layer 2 — Meta-filter: meta_model_sell.pkl  -> доп. фильтр для SELL
-  Layer 3 — Фильтры: ADX режим + 4H MTF + BTC macro + Funding Rate
-  Layer 4 — Market Regime: адаптивный порог под тренд/боковик/волатильность
+live_signal.py v7.0 — Stacking Ensemble + Новые признаки + Исправленный meta-filter
+АРХИТЕКТУРА v7.0:
+  Layer 1 — BUY-модель:  XGB_buy + LGBM_buy  -> p_buy_raw
+  Layer 1 — SELL-модель: XGB_sell + LGBM_sell -> p_sell_raw
+  Layer 1.5 — Stacking:  LogReg(p_xgb, p_lgbm, avg, diff) -> p_buy/p_sell (лучшая калибровка)
+  Layer 2 — Meta-filter: meta_model_buy/sell  -> доп. фильтр
+  Layer 3 — Фильтры: ADX + 4H MTF + BTC macro + Funding Rate
+  Layer 4 — Market Regime: адаптивный порог
+
+НОВОЕ в v7.0:
+  - Stacking inference: если stack-модель доступна, используем её вероятности
+    вместо простого усреднения XGB+LGBM
+  - Новые признаки: Hurst, VWAP_dev, RV, OFI, Price_accel, Vol_cluster
+  - Совместимость с авто-пруном: загружаем feature list из model_features.json
 """
 
 import ccxt
@@ -33,17 +39,16 @@ logger = logging.getLogger(__name__)
 
 OKX_CONFIG = {'options': {'defaultType': 'spot'}, 'timeout': 30000}
 
-# Пути к мета-моделям (создаются auto_trainer.py автоматически)
 META_MODEL_BUY_PATH  = "meta_model_buy.pkl"
 META_MODEL_SELL_PATH = "meta_model_sell.pkl"
+STACK_MODEL_BUY_PATH  = "stack_model_buy.pkl"
+STACK_MODEL_SELL_PATH = "stack_model_sell.pkl"
 
-# Скользящий буфер уверенности для перцентильного фильтра
 _confidence_history: list = []
-_HISTORY_MAX = 48  # 48 часов истории
+_HISTORY_MAX = 48
 
-# Кэш funding rate — не долбим API каждую минуту
 _funding_cache: dict = {"rate": 0.0, "oi_change": 0.0, "bias": "neutral", "ts": 0.0}
-_FUNDING_TTL = 300  # секунд (5 минут)
+_FUNDING_TTL = 300
 
 
 # ===============================================================
@@ -73,20 +78,9 @@ def load_feature_cols() -> list:
 
 # ===============================================================
 # ORDER FLOW — Funding Rate + Open Interest
-# Институциональные боты используют это как доп. фильтр.
-# OKX отдаёт бесплатно через perpetual API.
-# Если TON нет на фьючерсах — тихо возвращает нейтраль.
 # ===============================================================
 
 def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
-    """
-    Получает Funding Rate и изменение Open Interest.
-    Логика интерпретации:
-      funding > +0.01%  = много лонгов (перегрет вверх) -> осторожно с BUY
-      funding < -0.01%  = много шортов (перегрет вниз)  -> осторожно с SELL
-      OI растёт + цена  = сильный тренд (хорошо для BUY)
-      OI падает + цена  = слабый тренд, возможный разворот
-    """
     global _funding_cache
 
     now = time.time()
@@ -103,11 +97,9 @@ def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
         swap_exchange = ccxt.okx({'options': {'defaultType': 'swap'}, 'timeout': 30000})
         swap_symbol   = symbol_spot + ":USDT"
 
-        # Funding Rate
         fr_data      = swap_exchange.fetch_funding_rate(swap_symbol)
         funding_rate = float(fr_data.get("fundingRate", 0.0))
 
-        # Open Interest delta
         oi_change_pct = 0.0
         try:
             oi_hist = swap_exchange.fetch_open_interest_history(
@@ -121,7 +113,6 @@ def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
         except Exception:
             pass
 
-        # Bias
         if funding_rate > 0.0001:
             bias = "long_crowded"
         elif funding_rate < -0.0001:
@@ -142,16 +133,69 @@ def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
             "ts":        now,
         })
 
-        logger.debug(
-            f"[OrderFlow] funding={funding_rate:.4%} "
-            f"OI_delta={oi_change_pct:+.2f}% bias={bias}"
-        )
-
     except Exception as e:
         logger.debug(f"[OrderFlow] Недоступно (нормально для spot): {e}")
-        _funding_cache["ts"] = now  # не стучимся ещё 5 минут
+        _funding_cache["ts"] = now
 
     return result
+
+
+# ===============================================================
+# ПРОФЕССИОНАЛЬНЫЕ ПРИЗНАКИ (синхронизированы с auto_trainer v7.0)
+# ===============================================================
+
+def _calc_hurst_window(series: np.ndarray, lags_range=range(2, 21)) -> float:
+    """Hurst Exponent для последних N значений."""
+    if len(series) < 20:
+        return 0.5
+    try:
+        lags = list(lags_range)
+        tau  = [max(np.std(np.subtract(series[lag:], series[:-lag])), 1e-9)
+                for lag in lags]
+        poly = np.polyfit(np.log(lags), np.log(tau), 1)
+        return float(max(0.0, min(1.0, poly[0])))
+    except Exception:
+        return 0.5
+
+
+def _calc_vwap_dev(df: pd.DataFrame, window: int = 20) -> float:
+    """VWAP отклонение последней точки."""
+    try:
+        tp    = (df['High'] + df['Low'] + df['Close']) / 3
+        vwap  = (tp * df['Volume']).rolling(window).sum() / df['Volume'].rolling(window).sum()
+        close = df['Close'].iloc[-1]
+        vwap_val = float(vwap.iloc[-1])
+        return (close - vwap_val) / (vwap_val + 1e-9) * 100
+    except Exception:
+        return 0.0
+
+
+def _calc_realized_vol(close: pd.Series, window: int = 20) -> float:
+    """Реализованная волатильность (annualized %)."""
+    try:
+        log_ret = np.log(close / close.shift(1)).dropna()
+        if len(log_ret) < window:
+            return 0.0
+        rv = np.sqrt((log_ret**2).rolling(window).sum().iloc[-1] / window * 8760) * 100
+        return float(rv)
+    except Exception:
+        return 0.0
+
+
+def _calc_ofi(df: pd.DataFrame) -> float:
+    """Order Flow Imbalance (нормализованный)."""
+    try:
+        close = df['Close']
+        high  = df['High']
+        low   = df['Low']
+        vol   = df['Volume']
+        bull  = ((close - low) / (high - low + 1e-9)) * vol
+        bear  = ((high - close) / (high - low + 1e-9)) * vol
+        ofi   = (bull - bear).rolling(10).sum()
+        total = vol.rolling(10).sum()
+        return float(ofi.iloc[-1] / (total.iloc[-1] + 1e-9))
+    except Exception:
+        return 0.0
 
 
 # ===============================================================
@@ -168,7 +212,6 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['Hour']      = d.index.hour
     d['DayOfWeek'] = d.index.dayofweek
 
-    # RSI 7, 14, 21
     for p in [7, 14, 21]:
         diff  = close.diff()
         g     = diff.clip(lower=0)
@@ -177,14 +220,12 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
         avg_l = l.ewm(com=p - 1, min_periods=p).mean()
         d[f'RSI_{p}'] = 100 - (100 / (1 + avg_g / (avg_l + 1e-9)))
 
-    # MACD
     ema12            = close.ewm(span=12, adjust=False).mean()
     ema26            = close.ewm(span=26, adjust=False).mean()
     d['MACD']        = ema12 - ema26
     d['MACD_signal'] = d['MACD'].ewm(span=9, adjust=False).mean()
     d['MACD_hist']   = d['MACD'] - d['MACD_signal']
 
-    # ATR
     tr    = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -197,7 +238,6 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['ATR_norm'] = atr14 / (close + 1e-9)
     d['ATR_ratio']= atr14 / (atr50 + 1e-9)
 
-    # Bollinger Bands
     sma20         = close.rolling(20).mean()
     std20         = close.rolling(20).std()
     bb_upper      = sma20 + 2 * std20
@@ -205,7 +245,6 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['BB_pos']   = (close - bb_lower) / (4 * std20 + 1e-9)
     d['BB_width'] = (bb_upper - bb_lower) / (sma20 + 1e-9)
 
-    # EMA ratios
     ema20  = close.ewm(span=20).mean()
     ema50  = close.ewm(span=50).mean()
     ema100 = close.ewm(span=100).mean()
@@ -213,23 +252,19 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['EMA_ratio_20_100'] = ema20 / (ema100 + 1e-9)
     d['EMA_ratio']        = d['EMA_ratio_20_50']
 
-    # Volume
     vol_sma20      = vol.rolling(20).mean()
     d['Vol_ratio'] = vol / (vol_sma20 + 1e-9)
 
-    # OBV
     obv           = (np.sign(close.diff()) * vol).fillna(0).cumsum()
     obv_sma20     = obv.rolling(20).mean()
     d['OBV_norm'] = (obv - obv_sma20) / (obv.rolling(20).std() + 1e-9)
 
-    # MFI
     tp          = (high + low + close) / 3
     mf          = tp * vol
     pos_mf      = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
     neg_mf      = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
     d['MFI_14'] = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
 
-    # StochRSI
     rsi14           = d['RSI_14']
     stoch_min       = rsi14.rolling(14).min()
     stoch_max       = rsi14.rolling(14).max()
@@ -237,16 +272,13 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['StochRSI_K'] = stoch_k
     d['StochRSI_D'] = stoch_k.rolling(3).mean()
 
-    # Williams %R
     hw14           = high.rolling(14).max()
     lw14           = low.rolling(14).min()
     d['WilliamsR'] = (hw14 - close) / (hw14 - lw14 + 1e-9) * -100
 
-    # Z-Score
     d['ZScore_20'] = (close - close.rolling(20).mean()) / (close.rolling(20).std() + 1e-9)
     d['ZScore_50'] = (close - close.rolling(50).mean()) / (close.rolling(50).std() + 1e-9)
 
-    # ADX
     up   = high.diff()
     down = -low.diff()
     pdm  = up.where((up > down)   & (up > 0),   0)
@@ -256,19 +288,51 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     dx   = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
     d['ADX'] = dx.ewm(alpha=1/14).mean()
 
-    # Свечные паттерны
     d['Body_pct']   = (close - d['Open']).abs() / (d['Open'] + 1e-9) * 100
     d['Upper_wick'] = (high - d[['Close','Open']].max(axis=1)) / (d['Open'] + 1e-9) * 100
     d['Lower_wick'] = (d[['Close','Open']].min(axis=1) - low) / (d['Open'] + 1e-9) * 100
     d['Doji']       = ((d['Body_pct'] / (high - low + 1e-9)) < 0.1).astype(int)
 
-    # Momentum
     d['Momentum_10'] = close - close.shift(10)
     d['ROC_10']      = close.pct_change(10) * 100
 
-    # Returns
     for h in [1, 4, 12, 24]:
         d[f'Return_{h}h'] = close.pct_change(h) * 100
+
+    # ── НОВЫЕ ПРИЗНАКИ v7.0 ──
+
+    # Hurst Exponent
+    d['Hurst'] = close.rolling(100, min_periods=50).apply(
+        lambda x: _calc_hurst_window(x.values), raw=True
+    )
+
+    # VWAP отклонения
+    tp_series = (high + low + close) / 3
+    vwap_20   = (tp_series * vol).rolling(20).sum() / vol.rolling(20).sum()
+    vwap_50   = (tp_series * vol).rolling(50).sum() / vol.rolling(50).sum()
+    d['VWAP_dev_20']   = (close - vwap_20) / (vwap_20 + 1e-9) * 100
+    d['VWAP_dev_50']   = (close - vwap_50) / (vwap_50 + 1e-9) * 100
+    bull_vol = vol.where(close > vwap_20, 0).rolling(10).sum()
+    d['VWAP_bull_ratio'] = bull_vol / (vol.rolling(10).sum() + 1e-9)
+
+    # Реализованная волатильность
+    log_ret     = np.log(close / close.shift(1))
+    d['RV_20']  = np.sqrt((log_ret**2).rolling(20).sum() / 20 * 8760) * 100
+    d['RV_50']  = np.sqrt((log_ret**2).rolling(50).sum() / 50 * 8760) * 100
+    d['RV_ratio'] = d['RV_20'] / (d['RV_50'] + 1e-9)
+
+    # Order Flow Imbalance
+    bull_frac = (close - low) / (high - low + 1e-9)
+    bear_frac = (high - close) / (high - low + 1e-9)
+    ofi_raw   = (bull_frac * vol - bear_frac * vol).rolling(10).sum()
+    d['OFI']  = ofi_raw / (vol.rolling(10).sum() + 1e-9)
+
+    # Ценовое ускорение
+    ret_1h       = close.pct_change(1)
+    d['Price_accel'] = ret_1h - ret_1h.shift(1)
+
+    # Кластеризация волатильности
+    d['Vol_cluster'] = (log_ret**2).ewm(span=5).mean() / ((log_ret**2).ewm(span=20).mean() + 1e-9)
 
     return d.dropna()
 
@@ -326,6 +390,11 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     std20 = close.rolling(20).std()
     d['BB_pos_4h'] = (close - (sma20 - 2*std20)) / (4*std20 + 1e-9)
 
+    # Hurst для 4H (трендовость на старшем ТФ)
+    d['Hurst_4h'] = close.rolling(60, min_periods=30).apply(
+        lambda x: _calc_hurst_window(x.values, range(2, 15)), raw=True
+    )
+
     return d.dropna()
 
 
@@ -346,17 +415,9 @@ def get_btc_4h_change(exchange) -> float:
 
 # ===============================================================
 # MARKET REGIME DETECTION
-# Адаптируем порог уверенности под режим рынка.
-# Боковик и высокая волатильность требуют большей уверенности.
 # ===============================================================
 
 def detect_market_regime(adx: float, atr_ratio: float, bb_width: float) -> dict:
-    """
-    TRENDING  — ADX > 30, нормальная волатильность -> порог стандартный (x1.00)
-    RANGING   — ADX < 20, узкий BB                -> требуем больше     (x1.15)
-    VOLATILE  — ATR выше нормы в 1.8x              -> требуем больше     (x1.25)
-    NEUTRAL   — всё остальное                      -> чуть выше          (x1.05)
-    """
     if adx > 30 and atr_ratio < 1.5:
         return {"regime": "TRENDING",  "mult": 1.00, "note": f"Тренд ADX={adx:.1f}"}
     elif adx < 20 and bb_width < 0.05:
@@ -387,11 +448,6 @@ def _percentile_filter(confidence: float) -> bool:
 # ===============================================================
 
 def _load_models() -> dict:
-    """
-    Загружает все модели.
-    Базовые:  buy_xgb, buy_lgbm, sell_xgb, sell_lgbm
-    Мета:     meta_buy, meta_sell (создаются auto_trainer.py — опциональны)
-    """
     models = {}
 
     for key, path in [
@@ -409,21 +465,61 @@ def _load_models() -> dict:
     for key, path in [
         ('meta_buy',  META_MODEL_BUY_PATH),
         ('meta_sell', META_MODEL_SELL_PATH),
+        ('stack_buy',  STACK_MODEL_BUY_PATH),
+        ('stack_sell', STACK_MODEL_SELL_PATH),
     ]:
         if os.path.exists(path):
             try:
                 models[key] = joblib.load(path)
-                logger.info(f"[Signal] Мета-модель загружена: {path}")
+                logger.info(f"[Signal] Загружена модель: {path}")
             except Exception as e:
-                logger.warning(f"[Signal] Мета-модель {path}: {e}")
+                logger.warning(f"[Signal] {path}: {e}")
 
     return models
 
 
 # ===============================================================
+# STACKING INFERENCE (новое v7.0)
+# ===============================================================
+
+def _apply_stacking(
+    models: dict,
+    p_xgb: float,
+    p_lgbm: float,
+    direction: str  # 'buy' или 'sell'
+) -> float:
+    """
+    Применяет stacking-ансамбль если доступен.
+    Stacking даёт лучшую калибровку вероятностей.
+    Если stack-модель недоступна — возвращает простое среднее.
+    """
+    stack_key = f'stack_{direction}'
+    if stack_key not in models:
+        return (p_xgb + p_lgbm) / 2.0
+
+    try:
+        stack_bundle = models[stack_key]
+        model  = stack_bundle['model']
+        scaler = stack_bundle['scaler']
+
+        p_avg  = (p_xgb + p_lgbm) / 2
+        p_diff = p_xgb - p_lgbm
+        X_stack = np.array([[p_xgb, p_lgbm, p_avg, p_diff]])
+        X_scaled = scaler.transform(X_stack)
+
+        p_stacked = float(model.predict_proba(X_scaled)[0][1])
+        logger.debug(
+            f"[Stack {direction.upper()}] xgb={p_xgb:.1%} lgbm={p_lgbm:.1%} "
+            f"avg={p_avg:.1%} → stacked={p_stacked:.1%}"
+        )
+        return p_stacked
+    except Exception as e:
+        logger.warning(f"[Signal] Stack {direction} ошибка: {e}")
+        return (p_xgb + p_lgbm) / 2.0
+
+
+# ===============================================================
 # META-MODEL INFERENCE
-# Совместимо с auto_trainer.py v6.0:
-# там мета-модель обучена на [original_features + p_side_model]
 # ===============================================================
 
 def _apply_meta_filter(
@@ -433,12 +529,6 @@ def _apply_meta_filter(
     model_key:  str,
     signal_dir: str,
 ) -> tuple:
-    """
-    Применяет мета-модель как фильтр.
-    auto_trainer обучает её на X + [p_side_model] — добавляем p_base последней фичей.
-    Возвращает (p_meta, meta_passed).
-    Если мета-модели нет — возвращает (None, True) и не блокирует.
-    """
     if model_key not in models:
         return None, True
 
@@ -463,10 +553,6 @@ def _apply_funding_correction(
     funding:    dict,
     threshold:  float,
 ) -> tuple:
-    """
-    Снижает уверенность если рынок перегрет в сторону сигнала.
-    Возвращает (новый_сигнал, новая_уверенность, заметка).
-    """
     funding_rate = funding.get("funding_rate", 0.0)
     oi_change    = funding.get("oi_change_pct", 0.0)
     bias         = funding.get("funding_bias", "neutral")
@@ -497,11 +583,12 @@ def _apply_funding_correction(
 
 def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
     """
-    Полный pipeline v6.0:
-      1. Загружаем модели (базовые + мета)
+    Полный pipeline v7.0:
+      1. Загружаем модели (базовые + stack + мета)
       2. Получаем 1H + 4H свечи + Funding Rate
-      3. Считаем индикаторы
-      4. Layer 1: XGB + LGBM -> p_buy, p_sell
+      3. Считаем индикаторы (включая новые: Hurst, VWAP, RV, OFI)
+      4. Layer 1: XGB + LGBM -> p_xgb, p_lgbm
+      4.5. Layer 1.5: Stacking -> p_buy/p_sell (или avg если нет stack)
       5. Market Regime -> адаптивный порог
       6. Layer 2: Meta-model фильтр
       7. Фильтры: percentile -> ADX -> 4H MTF -> BTC -> Funding
@@ -520,9 +607,9 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
 
         # 2. Данные
         exchange = _get_exchange()
-        ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
+        ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
 
-        if not ohlcv_1h or len(ohlcv_1h) < 100:
+        if not ohlcv_1h or len(ohlcv_1h) < 150:
             logger.warning("[Signal] Мало 1H данных")
             return None
 
@@ -539,7 +626,6 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             except Exception as e:
                 logger.warning(f"[Signal] 4H ошибка: {e}")
 
-        # Funding Rate (тихо если недоступен)
         funding_data = get_funding_data(symbol)
 
         # 3. Вектор фичей
@@ -554,6 +640,7 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 row_data[col] = 0.0
 
         X = np.array([[row_data[c] for c in feature_cols]], dtype=np.float32)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 4. Layer 1: базовые вероятности
         p_buy_xgb   = float(models['buy_xgb'].predict_proba(X)[0][1])   if 'buy_xgb'   in models else 0.0
@@ -561,12 +648,15 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         p_sell_xgb  = float(models['sell_xgb'].predict_proba(X)[0][1])  if 'sell_xgb'  in models else 0.0
         p_sell_lgbm = float(models['sell_lgbm'].predict_proba(X)[0][1]) if 'sell_lgbm' in models else p_sell_xgb
 
-        p_buy  = (p_buy_xgb  + p_buy_lgbm)  / 2.0
-        p_sell = (p_sell_xgb + p_sell_lgbm) / 2.0
+        # 4.5. Layer 1.5: Stacking (новое v7.0)
+        p_buy  = _apply_stacking(models, p_buy_xgb,  p_buy_lgbm,  'buy')
+        p_sell = _apply_stacking(models, p_sell_xgb, p_sell_lgbm, 'sell')
 
+        has_stack = 'stack_buy' in models or 'stack_sell' in models
         models_used = "+".join(filter(None, [
-            "XGB"  if 'buy_xgb'  in models else "",
-            "LGBM" if 'buy_lgbm' in models else "",
+            "XGB"   if 'buy_xgb'   in models else "",
+            "LGBM"  if 'buy_lgbm'  in models else "",
+            "STACK" if has_stack              else "",
         ]))
 
         # 5. Market Regime -> адаптивный порог
@@ -575,9 +665,16 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         bb_width  = float(last_1h.get('BB_width',  0.05))
         rsi_14    = float(last_1h.get('RSI_14',    50.0))
         vol_ratio = float(last_1h.get('Vol_ratio',  1.0))
+        hurst     = float(last_1h.get('Hurst',      0.5))
 
         regime              = detect_market_regime(adx_1h, atr_ratio, bb_width)
         regime_mult         = regime["mult"]
+
+        # Дополнительный Hurst-фильтр: если рынок случайный (H≈0.5) — поднимаем порог
+        if 0.45 <= hurst <= 0.55:
+            regime_mult = max(regime_mult, 1.10)
+            logger.debug(f"[Signal] Hurst={hurst:.3f} близко к 0.5 — рынок случайный, mult={regime_mult:.2f}")
+
         effective_threshold = MIN_CONFIDENCE * regime_mult
 
         # 6. Первичный сигнал
@@ -616,18 +713,15 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         # 8. Фильтр-цепочка
         filter_log = []
 
-        # 8a. Перцентильный фильтр
         if signal != "HOLD":
             if not _percentile_filter(confidence):
                 filter_log.append(f"PERCENTILE_LOW_{confidence:.1%}")
                 signal = "HOLD"
 
-        # 8b. ADX фильтр
         if REGIME_FILTER_ENABLED and signal != "HOLD" and adx_1h < REGIME_ADX_THRESHOLD:
             filter_log.append(f"ADX={adx_1h:.1f}<{REGIME_ADX_THRESHOLD}")
             signal = "HOLD"
 
-        # 8c. Multi-TF 4H фильтр
         mtf_confirmed = True
         if MTF_ENABLED and df4h_feats is not None and signal != "HOLD":
             last_4h      = df4h_feats.iloc[-1]
@@ -644,7 +738,6 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 signal        = "HOLD"
                 mtf_confirmed = False
 
-        # 8d. BTC macro фильтр
         btc_change  = 0.0
         btc_blocked = False
         if BTC_FILTER_ENABLED and signal == "BUY":
@@ -654,7 +747,6 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 signal      = "HOLD"
                 btc_blocked = True
 
-        # 8e. Funding Rate коррекция
         funding_note = ""
         if signal != "HOLD":
             signal, confidence, funding_note = _apply_funding_correction(
@@ -675,15 +767,15 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             models_used += "+META"
 
         logger.info(
-            f"[Signal v6.0] {signal} | "
+            f"[Signal v7.0] {signal} | "
             f"p_buy={p_buy:.1%}(xgb={p_buy_xgb:.1%} lgbm={p_buy_lgbm:.1%}) | "
             f"p_sell={p_sell:.1%}(xgb={p_sell_xgb:.1%} lgbm={p_sell_lgbm:.1%}) | "
+            f"Hurst={hurst:.3f} | "
             f"meta={'OK' if not meta_blocked else 'BLOCK'} | "
             f"Regime={regime['regime']}x{regime_mult:.2f} | "
             f"ADX={adx_1h:.1f} | 4H={'OK' if mtf_confirmed else 'NO'} | "
             f"BTC={btc_change:+.2f}% | "
-            f"Funding={funding_data.get('funding_rate', 0):.4%} "
-            f"OI={funding_data.get('oi_change_pct', 0):+.1f}% | "
+            f"Funding={funding_data.get('funding_rate', 0):.4%} | "
             f"Price=${cur_price:.4f} | filters={filter_log} | {elapsed}s"
         )
 
@@ -704,6 +796,9 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             "p_meta":        round(p_meta, 4) if p_meta is not None else None,
             "meta_blocked":  meta_blocked,
             "models_used":   models_used,
+
+            # Новые метрики v7.0
+            "hurst":         round(hurst, 3),
 
             # Рыночный контекст
             "price":         cur_price,
@@ -731,7 +826,7 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             "btc_blocked":   btc_blocked,
             "filter_log":    filter_log,
 
-            # Совместимость со старым app.py
+            # Совместимость
             "xgb_signal":   signal,
             "lgbm_signal":  signal,
 

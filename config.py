@@ -1,12 +1,10 @@
 """
-config.py — Централизованная конфигурация TradeBot v5.0
-v5.0 — Двойные бинарные классификаторы:
-  - BUY-модель: бинарный XGB+LGBM
-  - SELL-модель: бинарный XGB+LGBM
-  - SMOTE балансировка
-  - Optuna гиперпараметр-тюнинг
-  - ML-бэктест
-  - Порог топ перцентиля уверенности
+config.py — Централизованная конфигурация TradeBot v7.0
+v7.0 — Исправлен data leakage + Stacking + Feature Pruning + Новые признаки:
+  - Hurst Exponent, VWAP Deviation, Realized Volatility, Order Flow Imbalance
+  - Kelly Criterion position sizing
+  - Stacking ансамбль (LogReg поверх XGB+LGBM)
+  - Исправлен meta-labeling (OOF вместо in-sample)
 """
 
 import os
@@ -49,14 +47,13 @@ BREAKEVEN_ACTIVATION    = 0.010
 TRADE_AMOUNT = 10.0
 
 # ═══════════════════════════════════════════
-# ПОРОГИ СИГНАЛОВ v5.0
+# ПОРОГИ СИГНАЛОВ v7.0
 # ═══════════════════════════════════════════
-MIN_CONFIDENCE          = 0.58    # p(BUY) >= 0.58 от бинарного классификатора
-STRONG_SIGNAL           = 0.70    # p >= 0.70 → сильный сигнал, +50% размер
+MIN_CONFIDENCE          = 0.58
+STRONG_SIGNAL           = 0.70
 SIGNAL_INTERVAL_MINUTES = 60
 
-# Перцентиль уверенности: торгуем только топ-N% сигналов
-CONFIDENCE_PERCENTILE   = 65      # топ-35% по уверенности
+CONFIDENCE_PERCENTILE   = 65
 
 MTF_ENABLED             = True
 BTC_FILTER_ENABLED      = True
@@ -78,7 +75,7 @@ WF_TEST_DAYS  = 14
 WF_STEP_DAYS  = 7
 
 # ═══════════════════════════════════════════
-# ML / МОДЕЛИ v5.0
+# ML / МОДЕЛИ v7.0
 # ═══════════════════════════════════════════
 MODEL_PATH_BUY_XGB   = "model_buy_xgb.pkl"
 MODEL_PATH_BUY_LGBM  = "model_buy_lgbm.pkl"
@@ -87,11 +84,16 @@ MODEL_PATH_SELL_LGBM = "model_sell_lgbm.pkl"
 MODEL_FEATURES_PATH  = "model_features.json"
 STATS_FILE           = "training_stats.json"
 
+# Новые модели v7.0
+STACK_MODEL_BUY_PATH  = "stack_model_buy.pkl"
+STACK_MODEL_SELL_PATH = "stack_model_sell.pkl"
+FEATURE_IMPORTANCE_PATH = "feature_importance.json"
+
 # Обратная совместимость
 MODEL_PATH      = "model_buy_xgb.pkl"
 MODEL_PATH_LGBM = "model_buy_lgbm.pkl"
 
-# ── Фичи 1H ──────────────────────────────
+# ── Фичи 1H (оригинальные) ───────────────
 FEATURE_COLS_1H = [
     'RSI_14', 'RSI_7', 'RSI_21',
     'MACD', 'MACD_signal', 'MACD_hist',
@@ -108,7 +110,7 @@ FEATURE_COLS_1H = [
     'Momentum_10', 'ROC_10',
 ]
 
-# ── Фичи 4H ──────────────────────────────
+# ── Фичи 4H (оригинальные) ───────────────
 FEATURE_COLS_4H = [
     'RSI_14_4h', 'RSI_7_4h',
     'MACD_hist_4h',
@@ -120,8 +122,34 @@ FEATURE_COLS_4H = [
     'BB_pos_4h',
 ]
 
-FEATURE_COLS = FEATURE_COLS_1H + FEATURE_COLS_4H
+# ── НОВЫЕ ПРОФЕССИОНАЛЬНЫЕ ФИЧИ v7.0 ─────
+FEATURE_COLS_V7 = [
+    # Trендовость и mean-reversion
+    'Hurst',            # Hurst Exponent 1H (H>0.6=тренд, H<0.4=mean-rev)
+    'Hurst_4h',         # Hurst Exponent 4H
 
+    # VWAP (институциональная справедливая цена)
+    'VWAP_dev_20',      # Отклонение от 20-бар VWAP (%)
+    'VWAP_dev_50',      # Отклонение от 50-бар VWAP (%)
+    'VWAP_bull_ratio',  # Доля бычьего объёма относительно VWAP
+
+    # Реализованная волатильность
+    'RV_20',            # Realized Volatility 20-баров (annualized %)
+    'RV_50',            # Realized Volatility 50-баров
+    'RV_ratio',         # RV_20 / RV_50 (краткосрочная vs долгосрочная)
+
+    # Order Flow
+    'OFI',              # Order Flow Imbalance (покупатели vs продавцы)
+
+    # Производные цены
+    'Price_accel',      # Ускорение цены (вторая производная)
+    'Vol_cluster',      # Кластеризация волатильности (GARCH-прокси)
+]
+
+# Полный список фичей v7.0
+FEATURE_COLS = FEATURE_COLS_1H + FEATURE_COLS_4H + FEATURE_COLS_V7
+
+# Legacy (для обратной совместимости)
 FEATURE_COLS_LEGACY = [
     'RSI_14', 'RSI_7', 'MACD', 'MACD_signal', 'MACD_hist',
     'ATR_pct', 'ADX', 'BB_pos', 'EMA_ratio_20_50', 'Vol_ratio',

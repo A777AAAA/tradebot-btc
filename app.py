@@ -335,6 +335,9 @@ def retrainer_loop():
                 logger.warning(f"[Retrainer] Неудача: {result.get('error')}")
         except Exception as e:
             logger.error(f"[Retrainer] Ошибка: {e}", exc_info=True)
+            # При ошибке — повтор через 2 часа, не ждём 24ч
+            time.sleep(2 * 60 * 60)
+            continue
 
         time.sleep(24 * 60 * 60)
 

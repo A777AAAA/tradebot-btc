@@ -303,7 +303,7 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
 
     # Hurst Exponent
     d['Hurst'] = close.rolling(100, min_periods=50).apply(
-        lambda x: _calc_hurst_window(x.values), raw=True
+        lambda x: _calc_hurst_window(x), raw=True
     )
 
     # VWAP отклонения
@@ -392,7 +392,7 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
 
     # Hurst для 4H (трендовость на старшем ТФ)
     d['Hurst_4h'] = close.rolling(60, min_periods=30).apply(
-        lambda x: _calc_hurst_window(x.values, range(2, 15)), raw=True
+        lambda x: _calc_hurst_window(x, range(2, 15)), raw=True
     )
 
     return d.dropna()

@@ -1098,12 +1098,12 @@ def train_model() -> dict:
     logger.info("[Trainer] 🔄 SMOTE SELL...")
     X_sell_sm, y_sell_sm = apply_smote(X_sell_train, y_sell_train)
 
-    # 8. Optuna
+    # 8. Optuna — валидация на ОРИГИНАЛЬНОМ (не SMOTE) тесте, чтобы избежать прецизии 1.0
+    # SMOTE данные используем только для обучения, валидация на реальных данных
     logger.info("[Trainer] 🔬 Optuna тюнинг BUY (30 trials)...")
-    val_split   = int(len(X_buy_sm) * 0.85)
     best_params = tune_xgboost(
-        X_buy_sm[:val_split], y_buy_sm[:val_split],
-        X_buy_sm[val_split:], y_buy_sm[val_split:],
+        X_buy_sm, y_buy_sm,
+        X_buy_test, y_buy_test,
         n_trials=30
     )
 
@@ -1193,15 +1193,16 @@ def train_model() -> dict:
         sell_xgb
     )
 
-    # 14. Walk-Forward
-    hours_per_day = 24
-    wf_train = WF_TRAIN_DAYS * hours_per_day
-    wf_test  = WF_TEST_DAYS  * hours_per_day
-    wf_step  = WF_STEP_DAYS  * hours_per_day
+    # 14. Walk-Forward — адаптивные размеры окон под реальный объём данных
+    n_samples_buy = len(X_buy)
+    # Используем 60% данных как тренировочное окно, 15% как тест, шаг 10%
+    wf_train = max(int(n_samples_buy * 0.55), 100)
+    wf_test  = max(int(n_samples_buy * 0.12), 30)
+    wf_step  = max(int(n_samples_buy * 0.08), 20)
 
-    logger.info("[Trainer] 📊 Walk-Forward BUY...")
+    logger.info(f"[Trainer] 📊 Walk-Forward BUY (train={wf_train} test={wf_test} step={wf_step})...")
     wf_buy  = walk_forward_binary(X_buy,  y_buy,  wf_train, wf_test, wf_step)
-    logger.info("[Trainer] 📊 Walk-Forward SELL...")
+    logger.info(f"[Trainer] 📊 Walk-Forward SELL (train={wf_train} test={wf_test} step={wf_step})...")
     wf_sell = walk_forward_binary(X_sell, y_sell, wf_train, wf_test, wf_step)
     logger.info(
         f"[Trainer] WF BUY:  prec={wf_buy['wf_precision']:.1%} "

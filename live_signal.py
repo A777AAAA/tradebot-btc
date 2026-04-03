@@ -16,7 +16,7 @@ live_signal.py v8.0 — Реальный Order Book OFI + Regime-Switching + К�
   - Все v7.0 улучшения сохранены
 """
 
-import ccxt
+import requests
 import json
 import joblib
 import logging
@@ -38,7 +38,7 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-OKX_CONFIG = {'options': {'defaultType': 'spot'}, 'timeout': 30000}
+OKX_REST = 'https://www.okx.com'
 
 META_MODEL_BUY_PATH   = "meta_model_buy.pkl"
 META_MODEL_SELL_PATH  = "meta_model_sell.pkl"
@@ -62,8 +62,30 @@ _OB_OFI_TTL = 120
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===============================================================
 
-def _get_exchange():
-    return ccxt.okx(OKX_CONFIG)
+def _fetch_candles(inst_id: str, bar: str = "1H", limit: int = 250, after: str = None) -> list:
+    """Получаем свечи через публичный REST OKX без ключей"""
+    url = f"{OKX_REST}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
+    if after:
+        url += f"&after={after}"
+    try:
+        r = requests.get(url, timeout=15)
+        return r.json().get("data", [])
+    except Exception as e:
+        logger.error(f"[Signal] fetch_candles error: {e}")
+        return []
+
+
+def _to_df_rest(data: list) -> pd.DataFrame:
+    """Конвертируем REST ответ в DataFrame"""
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data, columns=['ts','Open','High','Low','Close','Volume','VolCcy','VolCcyQuote','Confirm'])
+    df = df[['ts','Open','High','Low','Close','Volume']].copy()
+    df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='ms')
+    df.set_index('ts', inplace=True)
+    for col in ['Open','High','Low','Close','Volume']:
+        df[col] = df[col].astype(float)
+    return df.sort_index()
 
 
 def _to_df(ohlcv: list) -> pd.DataFrame:
@@ -221,20 +243,21 @@ def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
     result = {"funding_rate": 0.0, "oi_change_pct": 0.0, "funding_bias": "neutral"}
 
     try:
-        swap_exchange = ccxt.okx({'options': {'defaultType': 'swap'}, 'timeout': 30000})
-        swap_symbol   = symbol_spot + ":USDT"
-
-        fr_data      = swap_exchange.fetch_funding_rate(swap_symbol)
-        funding_rate = float(fr_data.get("fundingRate", 0.0))
+        # OKX REST: funding rate
+        inst_id_swap = symbol_spot.replace("/", "-") + "-SWAP"
+        fr_url = f"{OKX_REST}/api/v5/public/funding-rate?instId={inst_id_swap}"
+        fr_r   = requests.get(fr_url, timeout=10)
+        fr_d   = fr_r.json().get("data", [{}])
+        funding_rate = float(fr_d[0].get("fundingRate", 0.0)) if fr_d else 0.0
 
         oi_change_pct = 0.0
         try:
-            oi_hist = swap_exchange.fetch_open_interest_history(
-                swap_symbol, timeframe='1h', limit=3
-            )
-            if oi_hist and len(oi_hist) >= 2:
-                oi_now  = float(oi_hist[-1].get("openInterestAmount", 1))
-                oi_prev = float(oi_hist[-2].get("openInterestAmount", 1))
+            oi_url = f"{OKX_REST}/api/v5/rubric/open-interest?instId={inst_id_swap}&period=1H&limit=3"
+            oi_r   = requests.get(oi_url, timeout=10)
+            oi_d   = oi_r.json().get("data", [])
+            if len(oi_d) >= 2:
+                oi_now  = float(oi_d[0].get("oi", 1))
+                oi_prev = float(oi_d[1].get("oi", 1))
                 if oi_prev > 0:
                     oi_change_pct = (oi_now - oi_prev) / oi_prev * 100
         except Exception:
@@ -483,7 +506,8 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
 
 def get_btc_4h_change(exchange) -> float:
     try:
-        ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe='4h', limit=5)
+        data_btc = _fetch_candles("BTC-USDT", "4H", 5)
+        ohlcv = [[int(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])] for d in data_btc] if data_btc else []
         if not ohlcv or len(ohlcv) < 2:
             return 0.0
         return (float(ohlcv[-1][4]) - float(ohlcv[-2][4])) / float(ohlcv[-2][4]) * 100
@@ -772,8 +796,9 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         feature_cols = load_feature_cols()
 
         # 2. Данные
-        exchange = _get_exchange()
-        ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
+        inst = symbol.replace("/", "-")
+        data_1h = _fetch_candles(inst, "1H", 300)
+        ohlcv_1h = [[int(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])] for d in data_1h] if data_1h else []
 
         if not ohlcv_1h or len(ohlcv_1h) < 150:
             logger.warning("[Signal] Мало 1H данных")
@@ -786,7 +811,8 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         df4h_feats = None
         if MTF_ENABLED:
             try:
-                ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=100)
+                data_4h = _fetch_candles(inst, "4H", 100)
+                ohlcv_4h = [[int(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])] for d in data_4h] if data_4h else []
                 if ohlcv_4h and len(ohlcv_4h) >= 50:
                     df4h_feats = calc_indicators_4h(_to_df(ohlcv_4h))
             except Exception as e:

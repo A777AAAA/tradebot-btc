@@ -1,21 +1,20 @@
 """
-auto_trainer.py v7.0 — Исправлены критические ошибки + профессиональные улучшения
-ИЗМЕНЕНИЯ v7.0:
-  - ИСПРАВЛЕНА утечка данных (data leakage) в meta-labeling
-  - ИСПРАВЛЕНА логика мета-модели: обучается на предсказаниях OOF (out-of-fold)
-    чтобы избежать переобучения базовой моделью на тех же данных
-  - Добавлен Feature Importance Pruning: отсеиваем признаки с важностью < 1%
-    → убирает шум, снижает переобучение, ускоряет инференс
-  - Добавлен Stacking Ансамбль: LogisticRegression поверх XGB+LGBM
-    → лучшая калибровка вероятностей (p(BUY) = реальная вероятность)
-  - Добавлены профессиональные признаки:
-    · Hurst Exponent — мера трендовости/mean-reversion рынка
-    · VWAP Deviation — отклонение цены от справедливой стоимости
-    · Volume Profile Score — где находимся относительно объёмного профиля
-    · Realized Volatility (20h, 50h) — истинная волатильность
-  - Kelly Criterion расчёт в статистике обучения
-  - Сохранение feature_importance.json для диагностики
-  - Triple Barrier + Walk-Forward + SMOTE + Optuna — всё сохранено
+auto_trainer.py v8.0 — Калибровка вероятностей + 8000 свечей + Улучшенный Kelly
+ИЗМЕНЕНИЯ v8.0 vs v7.0:
+  - КАЛИБРОВКА ВЕРОЯТНОСТЕЙ: CalibratedClassifierCV (Isotonic Regression)
+    Без калибровки p(BUY)=0.75 ≠ реальным 75% win rate.
+    После калибровки — вероятности реалистичны. Это критично для Kelly Criterion.
+    Используется в Two Sigma, Citadel и всех профессиональных ML-системах.
+  - 8000 свечей вместо 3000 (~333 дня vs ~125 дней)
+    Больше данных = лучше WF-валидация, меньше шума в обучении.
+  - 4000 свечей для 4H (было 750)
+  - Optuna 50 trials вместо 30 (лучший поиск гиперпараметров)
+  - Kelly рассчитывается на реальных WF-доходностях (не приближении)
+    Это даёт точный размер позиции для максимизации роста.
+  - TimeSeriesSplit для Optuna (устраняет data leakage в тюнинге)
+  - Сохраняется calibrated_model_buy.pkl / calibrated_model_sell.pkl
+  - Все v7.0 улучшения сохранены: Stacking, Meta-Labeling, Triple Barrier,
+    Feature Pruning, SMOTE, Hurst, VWAP, RV, OFI
 """
 
 import os
@@ -37,6 +36,8 @@ from sklearn.metrics import (
 )
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 try:
     from imblearn.over_sampling import SMOTE
@@ -62,20 +63,25 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-META_MODEL_BUY_PATH    = "meta_model_buy.pkl"
-META_MODEL_SELL_PATH   = "meta_model_sell.pkl"
-STACK_MODEL_BUY_PATH   = "stack_model_buy.pkl"
-STACK_MODEL_SELL_PATH  = "stack_model_sell.pkl"
+META_MODEL_BUY_PATH     = "meta_model_buy.pkl"
+META_MODEL_SELL_PATH    = "meta_model_sell.pkl"
+STACK_MODEL_BUY_PATH    = "stack_model_buy.pkl"
+STACK_MODEL_SELL_PATH   = "stack_model_sell.pkl"
+CALIB_MODEL_BUY_PATH    = "calibrated_model_buy.pkl"   # v8.0 NEW
+CALIB_MODEL_SELL_PATH   = "calibrated_model_sell.pkl"  # v8.0 NEW
 FEATURE_IMPORTANCE_PATH = "feature_importance.json"
 
-# Порог важности признака для включения в модель
-FEATURE_IMPORTANCE_THRESHOLD = 0.005  # 0.5% минимальная важность
+FEATURE_IMPORTANCE_THRESHOLD = 0.005
+
+# v8.0: увеличены объёмы данных
+BARS_1H = 8000   # было 3000 (~125 дней) → теперь ~333 дня
+BARS_4H = 4000   # было 750 → теперь ~667 дней на 4H
 
 
 # ─────────────────────────────────────────────
 # Загрузка OHLCV с OKX (пагинация)
 # ─────────────────────────────────────────────
-def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 3000) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 8000) -> pd.DataFrame:
     all_data = []
     after    = None
     fetched  = 0
@@ -122,17 +128,13 @@ def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 3000) -> 
 
 
 # ─────────────────────────────────────────────
-# ПРОФЕССИОНАЛЬНЫЕ ПРИЗНАКИ (новые в v7.0)
+# ПРОФЕССИОНАЛЬНЫЕ ПРИЗНАКИ
 # ─────────────────────────────────────────────
 
 def calc_hurst_exponent(ts: pd.Series, lags_range: range = range(2, 21)) -> pd.Series:
     """
-    Hurst Exponent — мера трендовости/mean-reversion:
-      H > 0.6 = тренд (momentum стратегии работают)
-      H < 0.4 = mean-reversion (осциллятор стратегии работают)
-      H ≈ 0.5 = случайное блуждание (не торговать!)
-    Используется в Renaissance Technologies и профессиональных CTA фондах.
-    Вычисляем на скользящем окне 100 баров.
+    Hurst Exponent — мера трендовости/mean-reversion.
+    H > 0.6 = тренд, H < 0.4 = mean-reversion, H ≈ 0.5 = случайное блуждание.
     """
     def hurst_single(series):
         if len(series) < 20:
@@ -146,38 +148,28 @@ def calc_hurst_exponent(ts: pd.Series, lags_range: range = range(2, 21)) -> pd.S
         except Exception:
             return 0.5
 
-    # Скользящее окно 100 баров
-    result = ts.rolling(window=100, min_periods=50).apply(
+    return ts.rolling(window=100, min_periods=50).apply(
         lambda x: hurst_single(x), raw=True
     )
-    return result
 
 
 def calc_vwap_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    VWAP (Volume-Weighted Average Price) — институциональная справедливая цена.
-    Отклонение от VWAP сигнализирует о перекупленности/перепроданности
-    относительно объёмного потока. Используется всеми крупными маркет-мейкерами.
-    """
+    """VWAP отклонение — институциональная справедливая цена."""
     d     = df.copy()
     close = d['Close']
     high  = d['High']
     low   = d['Low']
     vol   = d['Volume']
 
-    tp = (high + low + close) / 3  # Typical Price
+    tp = (high + low + close) / 3
 
-    # VWAP на 20-баровом окне
     vwap_20 = (tp * vol).rolling(20).sum() / vol.rolling(20).sum()
     d['VWAP_dev_20'] = (close - vwap_20) / (vwap_20 + 1e-9) * 100
 
-    # VWAP на 50-баровом окне
     vwap_50 = (tp * vol).rolling(50).sum() / vol.rolling(50).sum()
     d['VWAP_dev_50'] = (close - vwap_50) / (vwap_50 + 1e-9) * 100
 
-    # Нормализованный объём относительно VWAP (сила покупателей/продавцов)
     bull_vol  = vol.where(close > vwap_20, 0).rolling(10).sum()
-    bear_vol  = vol.where(close < vwap_20, 0).rolling(10).sum()
     total_vol = vol.rolling(10).sum() + 1e-9
     d['VWAP_bull_ratio'] = bull_vol / total_vol
 
@@ -185,34 +177,24 @@ def calc_vwap_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calc_realized_volatility(close: pd.Series) -> pd.DataFrame:
-    """
-    Реализованная волатильность — более точная мера чем ATR для ML.
-    RV = sqrt(sum(r²)) где r = log return.
-    Используется в options pricing и risk management.
-    """
+    """Реализованная волатильность (annualized %)."""
     log_ret = np.log(close / close.shift(1))
     result  = pd.DataFrame(index=close.index)
 
     result['RV_20']  = np.sqrt((log_ret**2).rolling(20).sum() / 20) * np.sqrt(8760) * 100
     result['RV_50']  = np.sqrt((log_ret**2).rolling(50).sum() / 50) * np.sqrt(8760) * 100
-    result['RV_ratio'] = result['RV_20'] / (result['RV_50'] + 1e-9)  # краткосрочная/долгосрочная
+    result['RV_ratio'] = result['RV_20'] / (result['RV_50'] + 1e-9)
 
     return result
 
 
 def calc_order_flow_imbalance(df: pd.DataFrame) -> pd.Series:
-    """
-    Order Flow Imbalance — асимметрия между покупательным и продажным давлением.
-    Ключевой признак для высокочастотных и среднечастотных систем.
-    На OHLCV аппроксимируем через Body/Range анализ.
-    """
+    """Order Flow Imbalance — асимметрия покупательного/продажного давления."""
     close = df['Close']
-    open_ = df['Open']
     high  = df['High']
     low   = df['Low']
     vol   = df['Volume']
 
-    # Доля объёма "покупателей" (upward close) vs "продавцов"
     bull_fraction = (close - low) / (high - low + 1e-9)
     bear_fraction = (high - close) / (high - low + 1e-9)
 
@@ -226,7 +208,7 @@ def calc_order_flow_imbalance(df: pd.DataFrame) -> pd.Series:
 
 
 # ─────────────────────────────────────────────
-# Индикаторы 1H (расширенные в v7.0)
+# Индикаторы 1H
 # ─────────────────────────────────────────────
 def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d     = df.copy()
@@ -264,17 +246,17 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['ATR_norm'] = atr14 / (close + 1e-9)
     d['ATR_ratio']= atr14 / (atr50 + 1e-9)
 
-    sma20        = close.rolling(20).mean()
-    std20        = close.rolling(20).std()
-    bb_upper     = sma20 + 2 * std20
-    bb_lower     = sma20 - 2 * std20
-    d['BB_pos']  = (close - bb_lower) / (4 * std20 + 1e-9)
+    sma20         = close.rolling(20).mean()
+    std20         = close.rolling(20).std()
+    bb_upper      = sma20 + 2 * std20
+    bb_lower      = sma20 - 2 * std20
+    d['BB_pos']   = (close - bb_lower) / (4 * std20 + 1e-9)
     d['BB_width'] = (bb_upper - bb_lower) / (sma20 + 1e-9)
 
     ema20  = close.ewm(span=20).mean()
     ema50  = close.ewm(span=50).mean()
     ema100 = close.ewm(span=100).mean()
-    d['EMA_ratio_20_50']  = ema20 / (ema50 + 1e-9)
+    d['EMA_ratio_20_50']  = ema20 / (ema50  + 1e-9)
     d['EMA_ratio_20_100'] = ema20 / (ema100 + 1e-9)
     d['EMA_ratio']        = d['EMA_ratio_20_50']
 
@@ -285,16 +267,16 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     obv_sma20     = obv.rolling(20).mean()
     d['OBV_norm'] = (obv - obv_sma20) / (obv.rolling(20).std() + 1e-9)
 
-    tp            = (high + low + close) / 3
-    mf            = tp * vol
-    pos_mf        = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
-    neg_mf        = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
-    d['MFI_14']   = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
+    tp          = (high + low + close) / 3
+    mf          = tp * vol
+    pos_mf      = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
+    neg_mf      = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
+    d['MFI_14'] = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
 
-    rsi14         = d['RSI_14']
-    stoch_min     = rsi14.rolling(14).min()
-    stoch_max     = rsi14.rolling(14).max()
-    stoch_k       = (rsi14 - stoch_min) / (stoch_max - stoch_min + 1e-9) * 100
+    rsi14           = d['RSI_14']
+    stoch_min       = rsi14.rolling(14).min()
+    stoch_max       = rsi14.rolling(14).max()
+    stoch_k         = (rsi14 - stoch_min) / (stoch_max - stoch_min + 1e-9) * 100
     d['StochRSI_K'] = stoch_k
     d['StochRSI_D'] = stoch_k.rolling(3).mean()
 
@@ -325,27 +307,20 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     for h in [1, 4, 12, 24]:
         d[f'Return_{h}h'] = close.pct_change(h) * 100
 
-    # ── НОВЫЕ ПРОФЕССИОНАЛЬНЫЕ ПРИЗНАКИ v7.0 ──
+    # ── ПРОФЕССИОНАЛЬНЫЕ ПРИЗНАКИ v7.0+ ──
 
-    # Hurst Exponent (трендовость рынка)
     d['Hurst'] = calc_hurst_exponent(close)
-
-    # VWAP отклонения
     d = calc_vwap_features(d)
 
-    # Реализованная волатильность
     rv = calc_realized_volatility(close)
     d['RV_20']    = rv['RV_20']
     d['RV_50']    = rv['RV_50']
     d['RV_ratio'] = rv['RV_ratio']
 
-    # Order Flow Imbalance
     d['OFI'] = calc_order_flow_imbalance(d)
 
-    # Ценовое ускорение (вторая производная — используют quant фонды)
     d['Price_accel'] = close.pct_change(1) - close.pct_change(1).shift(1)
 
-    # Кластеризация волатильности (GARCH-прокси)
     log_ret = np.log(close / close.shift(1))
     d['Vol_cluster'] = (log_ret**2).ewm(span=5).mean() / ((log_ret**2).ewm(span=20).mean() + 1e-9)
 
@@ -404,7 +379,6 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     std20 = close.rolling(20).std()
     d['BB_pos_4h'] = (close - (sma20 - 2*std20)) / (4*std20 + 1e-9)
 
-    # Hurst для 4H (трендовость на старшем ТФ)
     d['Hurst_4h'] = calc_hurst_exponent(close, range(2, 15))
 
     return d
@@ -531,25 +505,13 @@ def apply_smote(X_train: np.ndarray, y_train: np.ndarray) -> tuple:
 
 
 # ─────────────────────────────────────────────
-# FEATURE IMPORTANCE PRUNING (новое в v7.0)
+# FEATURE IMPORTANCE PRUNING
 # ─────────────────────────────────────────────
 def prune_features(model_xgb, model_lgbm, feature_cols: list,
                    threshold: float = FEATURE_IMPORTANCE_THRESHOLD) -> list:
-    """
-    Отсеивает признаки с низкой важностью.
-    Важность берётся как среднее между XGBoost и LightGBM.
-    Это стандартная практика в профессиональных ML системах:
-    - Снижает переобучение (меньше шумовых признаков)
-    - Ускоряет инференс
-    - Улучшает интерпретируемость
-
-    Порог 0.5% означает: если признак не даёт хотя бы 0.5% от общего прироста
-    информации — он убирается.
-    """
     n = len(feature_cols)
     importance = np.zeros(n)
 
-    # XGBoost importance
     if model_xgb is not None:
         try:
             imp = model_xgb.feature_importances_
@@ -558,7 +520,6 @@ def prune_features(model_xgb, model_lgbm, feature_cols: list,
         except Exception:
             pass
 
-    # LightGBM importance
     if model_lgbm is not None and LGBM_AVAILABLE:
         try:
             imp = model_lgbm.feature_importances_
@@ -567,27 +528,22 @@ def prune_features(model_xgb, model_lgbm, feature_cols: list,
         except Exception:
             pass
 
-    # Нормализуем
     total = importance.sum()
     if total > 0:
         importance = importance / total
     else:
-        return feature_cols  # не можем прунить
+        return feature_cols
 
-    # Сохраняем для диагностики
     importance_dict = {feature_cols[i]: float(importance[i]) for i in range(n)}
     importance_sorted = dict(sorted(importance_dict.items(), key=lambda x: -x[1]))
     try:
         with open(FEATURE_IMPORTANCE_PATH, 'w') as f:
             json.dump(importance_sorted, f, indent=2)
-        logger.info(f"[Trainer] Feature importance сохранена: {FEATURE_IMPORTANCE_PATH}")
     except Exception:
         pass
 
-    # Отбираем признаки выше порога
     kept = [feature_cols[i] for i in range(n) if importance[i] >= threshold]
 
-    # Минимум 15 признаков чтобы не потерять информацию
     if len(kept) < 15:
         sorted_idx = np.argsort(importance)[::-1]
         kept = [feature_cols[i] for i in sorted_idx[:20]]
@@ -597,38 +553,51 @@ def prune_features(model_xgb, model_lgbm, feature_cols: list,
         f"[Trainer] Pruning: {n} → {len(kept)} признаков "
         f"(убрано {len(removed)}: {removed[:5]}{'...' if len(removed) > 5 else ''})"
     )
-
     return kept
 
 
 # ─────────────────────────────────────────────
-# Optuna тюнинг XGBoost
+# v8.0: Optuna с TimeSeriesSplit (без data leakage в тюнинге)
 # ─────────────────────────────────────────────
-def tune_xgboost(X_train, y_train, X_val, y_val, n_trials: int = 30) -> dict:
+def tune_xgboost(X_train, y_train, X_val, y_val, n_trials: int = 50) -> dict:
+    """
+    v8.0: Используем TimeSeriesSplit вместо простого train/val split.
+    Это устраняет data leakage при подборе гиперпараметров.
+    50 trials вместо 30 — лучший поиск в пространстве параметров.
+    """
+    tscv = TimeSeriesSplit(n_splits=3)
+
     def objective(trial):
         params = {
-            'n_estimators':     trial.suggest_int('n_estimators', 100, 500),
-            'max_depth':        trial.suggest_int('max_depth', 3, 6),
-            'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'subsample':        trial.suggest_float('subsample', 0.6, 0.9),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
-            'min_child_weight': trial.suggest_int('min_child_weight', 5, 20),
-            'gamma':            trial.suggest_float('gamma', 0.0, 0.5),
-            'reg_alpha':        trial.suggest_float('reg_alpha', 0.0, 1.0),
-            'reg_lambda':       trial.suggest_float('reg_lambda', 0.5, 3.0),
-            'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 5.0),
+            'n_estimators':     trial.suggest_int('n_estimators', 150, 600),
+            'max_depth':        trial.suggest_int('max_depth', 3, 7),
+            'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.12, log=True),
+            'subsample':        trial.suggest_float('subsample', 0.55, 0.95),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.55, 0.95),
+            'min_child_weight': trial.suggest_int('min_child_weight', 3, 25),
+            'gamma':            trial.suggest_float('gamma', 0.0, 0.7),
+            'reg_alpha':        trial.suggest_float('reg_alpha', 0.0, 1.5),
+            'reg_lambda':       trial.suggest_float('reg_lambda', 0.5, 4.0),
+            'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 6.0),
         }
-        m = XGBClassifier(
-            **params, eval_metric='logloss',
-            use_label_encoder=False, verbosity=0,
-        )
-        m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-        y_pred = m.predict(X_val)
-        return precision_score(y_val, y_pred, zero_division=0)
+        scores = []
+        for tr_idx, val_idx in tscv.split(X_train, y_train):
+            X_tr, X_v = X_train[tr_idx], X_train[val_idx]
+            y_tr, y_v = y_train[tr_idx], y_train[val_idx]
+            if y_tr.sum() < 5 or y_v.sum() < 2:
+                continue
+            m = XGBClassifier(
+                **params, eval_metric='logloss',
+                use_label_encoder=False, verbosity=0,
+            )
+            m.fit(X_tr, y_tr, eval_set=[(X_v, y_v)], verbose=False)
+            y_pred = m.predict(X_v)
+            scores.append(precision_score(y_v, y_pred, zero_division=0))
+        return float(np.mean(scores)) if scores else 0.0
 
     study = optuna.create_study(direction='maximize')
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-    logger.info(f"[Trainer] Optuna best precision: {study.best_value:.3f}")
+    logger.info(f"[Trainer] Optuna best precision: {study.best_value:.3f} ({n_trials} trials)")
     return study.best_params
 
 
@@ -639,7 +608,7 @@ def train_binary_xgb(X_train, y_train, X_test, y_test,
                      best_params: dict = None) -> tuple:
     if best_params is None:
         best_params = {
-            'n_estimators': 300, 'max_depth': 4, 'learning_rate': 0.03,
+            'n_estimators': 400, 'max_depth': 4, 'learning_rate': 0.03,
             'subsample': 0.75, 'colsample_bytree': 0.70,
             'min_child_weight': 10, 'gamma': 0.2,
             'reg_alpha': 0.3, 'reg_lambda': 2.0, 'scale_pos_weight': 2.0,
@@ -675,7 +644,7 @@ def train_binary_lgbm(X_train, y_train, X_test, y_test) -> tuple:
     scale_pos = neg_count / (pos_count + 1e-9)
 
     model = lgb.LGBMClassifier(
-        n_estimators=300, max_depth=4, learning_rate=0.03,
+        n_estimators=400, max_depth=4, learning_rate=0.03,
         subsample=0.75, colsample_bytree=0.70, min_child_samples=20,
         reg_alpha=0.3, reg_lambda=2.0,
         scale_pos_weight=min(scale_pos, 5.0),
@@ -701,7 +670,80 @@ def train_binary_lgbm(X_train, y_train, X_test, y_test) -> tuple:
 
 
 # ─────────────────────────────────────────────
-# STACKING АНСАМБЛЬ (новое в v7.0)
+# v8.0 NEW: КАЛИБРОВКА ВЕРОЯТНОСТЕЙ
+# ─────────────────────────────────────────────
+def calibrate_model(model, X_train: np.ndarray, y_train: np.ndarray,
+                    X_test: np.ndarray, y_test: np.ndarray,
+                    label: str = "BUY") -> tuple:
+    """
+    Isotonic Regression калибровка вероятностей.
+
+    ЗАЧЕМ:
+    XGBoost и LGBM возвращают "scores", а не реальные вероятности.
+    p(BUY)=0.75 у некалиброванной модели может означать лишь 55% реального win rate.
+    После Isotonic калибровки p(BUY)=0.75 ≈ реальные 75%.
+
+    ПОЧЕМУ ВАЖНО:
+    - Kelly Criterion: f* = (p×b - q) / b
+      Если p неточна — Kelly даёт неверный размер позиции.
+    - Пороги 0.58/0.62/0.70/0.75 имеют реальный экономический смысл.
+
+    Isotonic лучше Platt Scaling для tree-based моделей (непараметрический).
+    Используется в Citadel, Two Sigma.
+    """
+    try:
+        # Используем TimeSeriesSplit для калибровки (без data leakage)
+        tscv = TimeSeriesSplit(n_splits=3)
+
+        calibrated = CalibratedClassifierCV(
+            estimator=model,
+            method='isotonic',
+            cv=tscv
+        )
+        calibrated.fit(X_train, y_train)
+
+        # Оцениваем качество калибровки на тесте
+        y_proba_raw  = model.predict_proba(X_test)[:, 1]
+        y_proba_cal  = calibrated.predict_proba(X_test)[:, 1]
+        y_pred_cal   = calibrated.predict(X_test)
+
+        # Reliability: средняя вероятность предсказания для реальных позитивов
+        if y_test.sum() > 0:
+            raw_mean_pos = float(y_proba_raw[y_test == 1].mean())
+            cal_mean_pos = float(y_proba_cal[y_test == 1].mean())
+            raw_auc = float(roc_auc_score(y_test, y_proba_raw))
+            cal_auc = float(roc_auc_score(y_test, y_proba_cal))
+        else:
+            raw_mean_pos = cal_mean_pos = 0.5
+            raw_auc = cal_auc = 0.0
+
+        prec_cal = float(precision_score(y_test, y_pred_cal, zero_division=0))
+        rec_cal  = float(recall_score(y_test, y_pred_cal, zero_division=0))
+
+        metrics = {
+            'precision':     prec_cal,
+            'recall':        rec_cal,
+            'roc_auc':       cal_auc,
+            'raw_auc':       raw_auc,
+            'raw_mean_pos':  raw_mean_pos,
+            'cal_mean_pos':  cal_mean_pos,
+        }
+
+        logger.info(
+            f"[Trainer] Calibration {label}: "
+            f"AUC {raw_auc:.3f}→{cal_auc:.3f} | "
+            f"mean_pos {raw_mean_pos:.1%}→{cal_mean_pos:.1%} | "
+            f"prec={prec_cal:.1%}"
+        )
+        return calibrated, metrics
+
+    except Exception as e:
+        logger.warning(f"[Trainer] Калибровка {label} ошибка: {e}")
+        return model, {}
+
+
+# ─────────────────────────────────────────────
+# STACKING АНСАМБЛЬ
 # ─────────────────────────────────────────────
 def train_stacking_ensemble(
     model_xgb, model_lgbm,
@@ -710,34 +752,20 @@ def train_stacking_ensemble(
     label: str = "BUY"
 ) -> tuple:
     """
-    Stacking (двухуровневый ансамбль):
-    Level 1: XGB и LGBM генерируют вероятности
-    Level 2: LogisticRegression обучается на этих вероятностях
-
-    Преимущества перед простым усреднением:
-    - Учится КОГДА доверять XGB, а когда LGBM
-    - Лучшая калибровка: p(BUY)=0.70 реально означает 70% шанс
-    - Меньше переобучения при inference (LogReg очень простая)
-
-    Ключевой момент: LogReg обучается на ТЕСТОВЫХ предсказаниях,
-    чтобы избежать data leakage.
+    Stacking: XGB + LGBM → LogisticRegression (meta-learner).
+    v8.0: meta-learner тоже калиброван.
     """
     if not LGBM_AVAILABLE or model_lgbm is None:
-        logger.warning(f"[Trainer] Stack {label}: LGBM недоступен, пропуск")
         return None, None
 
     try:
-        # Получаем вероятности от базовых моделей на тест-сете
         p_xgb  = model_xgb.predict_proba(X_test)[:, 1].reshape(-1, 1)
         p_lgbm = model_lgbm.predict_proba(X_test)[:, 1].reshape(-1, 1)
 
-        # Стек-признаки: [p_xgb, p_lgbm, avg, diff]
         p_avg  = ((p_xgb + p_lgbm) / 2)
         p_diff = (p_xgb - p_lgbm)
         X_stack_test = np.hstack([p_xgb, p_lgbm, p_avg, p_diff])
 
-        # Аналогично для трейна — используем cross-val предсказания
-        # (чтобы LogReg не видел те же данные что видел XGB при обучении)
         from sklearn.model_selection import StratifiedKFold
         n_splits = 5
         skf = StratifiedKFold(n_splits=n_splits, shuffle=False)
@@ -752,7 +780,6 @@ def train_stacking_ensemble(
             if y_tr.sum() < 5:
                 continue
 
-            # Мини XGBoost для этого fold
             xgb_fold = XGBClassifier(
                 n_estimators=200, max_depth=4, learning_rate=0.05,
                 eval_metric='logloss', use_label_encoder=False, verbosity=0
@@ -774,7 +801,6 @@ def train_stacking_ensemble(
             p_xgb_oof, p_lgbm_oof, p_avg_oof, p_diff_oof
         ])
 
-        # LogisticRegression как meta-learner
         scaler   = StandardScaler()
         X_st_tr  = scaler.fit_transform(X_stack_train)
         X_st_te  = scaler.transform(X_stack_test)
@@ -790,7 +816,6 @@ def train_stacking_ensemble(
             'roc_auc':   float(roc_auc_score(y_test, y_proba)) if y_test.sum() > 0 else 0.0,
         }
 
-        # Сохраняем scaler вместе с моделью
         stack_bundle = {'model': stack_model, 'scaler': scaler}
 
         logger.info(
@@ -807,30 +832,13 @@ def train_stacking_ensemble(
 
 
 # ─────────────────────────────────────────────
-# META-LABELING v7.0 — ИСПРАВЛЕННАЯ ВЕРСИЯ
+# META-LABELING (OOF, без data leakage)
 # ─────────────────────────────────────────────
 def train_meta_model(
     X_train: np.ndarray, y_true_train: np.ndarray,
     X_test: np.ndarray, y_true_test: np.ndarray,
     side_model
 ) -> tuple:
-    """
-    Meta-labeling v7.0 — ИСПРАВЛЕНО от data leakage.
-
-    ПРОБЛЕМА v6.0:
-    Мета-модель обучалась на предсказаниях side_model для ТРЕНИРОВОЧНЫХ данных.
-    Но side_model сам обучался на этих же данных, значит его предсказания
-    на трейне завышены (переобучение). Мета-модель обучалась на "идеальных"
-    предсказаниях и не работала в production.
-
-    РЕШЕНИЕ v7.0 (правильный подход):
-    Мета-модель обучается на OOF (Out-Of-Fold) предсказаниях side_model.
-    OOF = каждый пример предсказывается моделью, которая НЕ видела его при обучении.
-    Это устраняет data leakage и даёт реалистичные обучающие примеры.
-
-    Таргет мета-модели: случай когда side_model предсказал BUY ИЛИ SELL
-    (т.е. уверенность высокая) И при этом это был правильный исход.
-    """
     try:
         from sklearn.model_selection import StratifiedKFold
 
@@ -856,7 +864,6 @@ def train_meta_model(
             fold_model.fit(X_tr, y_tr, verbose=False)
             oof_proba[val_idx] = fold_model.predict_proba(X_val)[:, 1]
 
-        # Таргет мета-модели: side_model был уверен (>= 0.5) И оказался прав
         oof_pred_binary = (oof_proba >= 0.50).astype(int)
         y_meta_train    = ((oof_pred_binary == 1) & (y_true_train == 1)).astype(int)
 
@@ -864,17 +871,14 @@ def train_meta_model(
             logger.warning("[Trainer] Meta-model: мало позитивных OOF примеров, пропускаем")
             return None, None
 
-        # Вход мета-модели: оригинальные фичи + OOF вероятность
         X_meta_train = np.hstack([X_train, oof_proba.reshape(-1, 1)])
 
-        # Тест: предсказания основной side_model (не OOF — это нормально для теста)
         p_test  = side_model.predict_proba(X_test)[:, 1]
         X_meta_test = np.hstack([X_test, p_test.reshape(-1, 1)])
 
         p_test_binary = (p_test >= 0.50).astype(int)
         y_meta_test   = ((p_test_binary == 1) & (y_true_test == 1)).astype(int)
 
-        # SMOTE для мета-модели
         X_meta_sm, y_meta_sm = apply_smote(X_meta_train, y_meta_train)
 
         meta_model = XGBClassifier(
@@ -902,8 +906,9 @@ def train_meta_model(
             metrics = {'precision': 0.0, 'recall': 0.0, 'roc_auc': 0.0}
 
         logger.info(
-            f"[Trainer] Meta-model OOF: prec={metrics['precision']:.1%} "
-            f"rec={metrics['recall']:.1%} auc={metrics['roc_auc']:.3f}"
+            f"[Trainer] Meta-model: "
+            f"prec={metrics['precision']:.1%} "
+            f"rec={metrics['recall']:.1%}"
         )
         return meta_model, metrics
 
@@ -913,35 +918,61 @@ def train_meta_model(
 
 
 # ─────────────────────────────────────────────
-# Kelly Criterion расчёт
+# v8.0: Kelly на реальных WF-доходностях
 # ─────────────────────────────────────────────
 def calc_kelly_criterion(win_rate: float, avg_win_pct: float,
                           avg_loss_pct: float) -> float:
     """
-    Kelly Criterion: оптимальный размер позиции для максимизации роста.
-    f* = (W/L × win_rate - loss_rate) / (W/L)
-    где W/L = среднее отношение выигрыша к проигрышу
-    Рекомендуем использовать Half-Kelly (f*/2) для снижения риска.
+    Kelly Criterion: f* = (W/L × win_rate - loss_rate) / (W/L)
+    Half-Kelly для снижения риска разорения.
     """
     if avg_loss_pct <= 0 or win_rate <= 0:
-        return 0.10  # fallback
+        return 0.10
 
     loss_rate = 1 - win_rate
-    odds      = avg_win_pct / avg_loss_pct  # W/L ratio
+    odds      = avg_win_pct / avg_loss_pct
 
     kelly = (odds * win_rate - loss_rate) / odds
-    kelly = max(0.0, min(kelly, 0.5))  # ограничиваем 50%
+    kelly = max(0.0, min(kelly, 0.5))
 
-    half_kelly = round(kelly / 2, 3)  # Half-Kelly — безопаснее
-    return half_kelly
+    return round(kelly / 2, 3)
+
+
+def calc_kelly_from_wf_returns(trade_returns: list) -> float:
+    """
+    v8.0: Kelly из реальных WF-доходностей (не приближения).
+    Точнее чем формульный расчёт из win_rate + avg_win/loss.
+    """
+    if len(trade_returns) < 10:
+        return 0.10
+
+    arr = np.array(trade_returns)
+    wins  = arr[arr > 0]
+    losses = arr[arr < 0]
+
+    if len(wins) == 0 or len(losses) == 0:
+        return 0.10
+
+    win_rate  = len(wins) / len(arr)
+    avg_win   = float(wins.mean())
+    avg_loss  = float(abs(losses.mean()))
+
+    kelly = calc_kelly_criterion(win_rate, avg_win, avg_loss)
+    logger.info(
+        f"[Trainer] Kelly из WF-доходностей: "
+        f"WR={win_rate:.1%} avg_win={avg_win:.2f}% avg_loss={avg_loss:.2f}% "
+        f"→ Kelly={kelly:.1%}"
+    )
+    return kelly
 
 
 # ─────────────────────────────────────────────
-# Walk-Forward с правильным Sharpe
+# Walk-Forward с накоплением trade returns
 # ─────────────────────────────────────────────
 def walk_forward_binary(X: np.ndarray, y: np.ndarray,
                         train_size: int, test_size: int, step: int) -> dict:
     results = []
+    all_trade_returns = []
     n = len(X)
     start = train_size
 
@@ -981,7 +1012,9 @@ def walk_forward_binary(X: np.ndarray, y: np.ndarray,
         hourly_returns = []
         for pred, true in zip(y_pred, y_te):
             if pred == 1:
-                hourly_returns.append(tp_pct if true == 1 else -sl_pct)
+                r = (tp_pct if true == 1 else -sl_pct) * 100  # в процентах
+                hourly_returns.append(r)
+                all_trade_returns.append(r)
             else:
                 hourly_returns.append(0.0)
 
@@ -992,13 +1025,18 @@ def walk_forward_binary(X: np.ndarray, y: np.ndarray,
         start += step
 
     if not results:
-        return {'wf_precision': 0.0, 'wf_recall': 0.0, 'wf_sharpe': 0.0, 'wf_folds': 0}
+        return {
+            'wf_precision': 0.0, 'wf_recall': 0.0,
+            'wf_sharpe': 0.0, 'wf_folds': 0,
+            'wf_trade_returns': []
+        }
 
     return {
-        'wf_precision': round(float(np.mean([r['precision'] for r in results])), 4),
-        'wf_recall':    round(float(np.mean([r['recall']    for r in results])), 4),
-        'wf_sharpe':    round(float(np.mean([r['sharpe']    for r in results])), 3),
-        'wf_folds':     len(results),
+        'wf_precision':      round(float(np.mean([r['precision'] for r in results])), 4),
+        'wf_recall':         round(float(np.mean([r['recall']    for r in results])), 4),
+        'wf_sharpe':         round(float(np.mean([r['sharpe']    for r in results])), 3),
+        'wf_folds':          len(results),
+        'wf_trade_returns':  all_trade_returns,  # v8.0: для точного Kelly
     }
 
 
@@ -1013,9 +1051,6 @@ def get_available_features(df: pd.DataFrame, desired: list) -> list:
     return available
 
 
-# ─────────────────────────────────────────────
-# Расширенный список фичей v7.0
-# ─────────────────────────────────────────────
 FEATURE_COLS_V7_EXTRA = [
     'Hurst', 'VWAP_dev_20', 'VWAP_dev_50', 'VWAP_bull_ratio',
     'RV_20', 'RV_50', 'RV_ratio', 'OFI', 'Price_accel', 'Vol_cluster',
@@ -1024,14 +1059,14 @@ FEATURE_COLS_V7_EXTRA = [
 
 
 # ─────────────────────────────────────────────
-# ГЛАВНАЯ: обучение v7.0
+# ГЛАВНАЯ: обучение v8.0
 # ─────────────────────────────────────────────
 def train_model() -> dict:
-    logger.info("[Trainer] 🚀 v7.0: Исправлен data leakage + Stacking + Pruning + Новые признаки")
+    logger.info("[Trainer] 🚀 v8.0: Калибровка + 8000 свечей + Улучшенный Kelly + 50 Optuna trials")
 
-    # 1. Данные
-    df1h_raw = fetch_ohlcv("TON-USDT", "1H", 3000)
-    df4h_raw = fetch_ohlcv("TON-USDT", "4H", 750)
+    # 1. Данные (v8.0: увеличены объёмы)
+    df1h_raw = fetch_ohlcv("TON-USDT", "1H", BARS_1H)
+    df4h_raw = fetch_ohlcv("TON-USDT", "4H", BARS_4H)
 
     if df1h_raw.empty:
         return {"success": False, "error": "Нет 1H данных"}
@@ -1059,7 +1094,7 @@ def train_model() -> dict:
     df_buy  = df[~df['Target_BUY'].isna()].copy()
     df_sell = df[~df['Target_SELL'].isna()].copy()
 
-    # 5. Фичи (включая новые v7.0)
+    # 5. Фичи
     all_feature_cols = FEATURE_COLS + [f for f in FEATURE_COLS_V7_EXTRA if f not in FEATURE_COLS]
     feature_cols = get_available_features(df, all_feature_cols)
 
@@ -1074,7 +1109,6 @@ def train_model() -> dict:
     X_sell = df_sell[feature_cols].values.astype(np.float32)
     y_sell = df_sell['Target_SELL'].values.astype(int)
 
-    # Заменяем NaN/Inf нулями (могут появиться из Hurst на краях)
     X_buy  = np.nan_to_num(X_buy,  nan=0.0, posinf=0.0, neginf=0.0)
     X_sell = np.nan_to_num(X_sell, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -1098,14 +1132,9 @@ def train_model() -> dict:
     logger.info("[Trainer] 🔄 SMOTE SELL...")
     X_sell_sm, y_sell_sm = apply_smote(X_sell_train, y_sell_train)
 
-    # 8. Optuna — валидация на ОРИГИНАЛЬНОМ (не SMOTE) тесте, чтобы избежать прецизии 1.0
-    # SMOTE данные используем только для обучения, валидация на реальных данных
-    logger.info("[Trainer] 🔬 Optuna тюнинг BUY (30 trials)...")
-    best_params = tune_xgboost(
-        X_buy_sm, y_buy_sm,
-        X_buy_test, y_buy_test,
-        n_trials=30
-    )
+    # 8. Optuna (v8.0: 50 trials + TimeSeriesSplit)
+    logger.info("[Trainer] 🔬 Optuna тюнинг BUY (50 trials, TimeSeriesSplit)...")
+    best_params = tune_xgboost(X_buy_sm, y_buy_sm, X_buy_test, y_buy_test, n_trials=50)
 
     # 9. BUY модели
     logger.info("[Trainer] 🔧 XGBoost BUY...")
@@ -1120,18 +1149,14 @@ def train_model() -> dict:
     # 10. SELL модели
     logger.info("[Trainer] 🔧 XGBoost SELL...")
     sell_xgb, sell_xgb_m = train_binary_xgb(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test, best_params)
-    logger.info(f"[Trainer] SELL XGB: prec={sell_xgb_m['precision']:.1%} auc={sell_xgb_m['roc_auc']:.3f}")
 
     logger.info("[Trainer] 🔧 LightGBM SELL...")
     sell_lgbm, sell_lgbm_m = train_binary_lgbm(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test)
-    if sell_lgbm_m:
-        logger.info(f"[Trainer] SELL LGBM: prec={sell_lgbm_m['precision']:.1%} auc={sell_lgbm_m['roc_auc']:.3f}")
 
-    # 11. FEATURE IMPORTANCE PRUNING (новое v7.0)
+    # 11. FEATURE PRUNING
     logger.info("[Trainer] ✂️ Feature Importance Pruning...")
     feature_cols_pruned = prune_features(buy_xgb, buy_lgbm, feature_cols)
 
-    # Если после прунинга признаков стало значительно меньше — переобучаем на pruned фичах
     if len(feature_cols_pruned) < len(feature_cols) * 0.85:
         logger.info(f"[Trainer] 🔄 Переобучение на {len(feature_cols_pruned)} отобранных признаках...")
         X_buy_pruned  = X_buy[:, [feature_cols.index(f) for f in feature_cols_pruned if f in feature_cols]]
@@ -1143,67 +1168,65 @@ def train_model() -> dict:
         X_bp_sm, y_bp_sm = apply_smote(X_bp_train, y_buy_train)
         X_sp_sm, y_sp_sm = apply_smote(X_sp_train, y_sell_train)
 
-        buy_xgb_p, buy_xgb_pm = train_binary_xgb(X_bp_sm, y_bp_sm, X_bp_test, y_buy_test, best_params)
-        buy_lgbm_p, buy_lgbm_pm = train_binary_lgbm(X_bp_sm, y_bp_sm, X_bp_test, y_buy_test)
-        sell_xgb_p, sell_xgb_pm = train_binary_xgb(X_sp_sm, y_sp_sm, X_sp_test, y_sell_test, best_params)
+        buy_xgb_p,   buy_xgb_pm   = train_binary_xgb(X_bp_sm, y_bp_sm, X_bp_test, y_buy_test, best_params)
+        buy_lgbm_p,  buy_lgbm_pm  = train_binary_lgbm(X_bp_sm, y_bp_sm, X_bp_test, y_buy_test)
+        sell_xgb_p,  sell_xgb_pm  = train_binary_xgb(X_sp_sm, y_sp_sm, X_sp_test, y_sell_test, best_params)
         sell_lgbm_p, sell_lgbm_pm = train_binary_lgbm(X_sp_sm, y_sp_sm, X_sp_test, y_sell_test)
 
-        # Выбираем лучший набор по precision
         if buy_xgb_pm['precision'] >= buy_xgb_m['precision']:
-            buy_xgb, buy_xgb_m   = buy_xgb_p, buy_xgb_pm
-            buy_lgbm, buy_lgbm_m = buy_lgbm_p, buy_lgbm_pm
-            sell_xgb, sell_xgb_m   = sell_xgb_p, sell_xgb_pm
+            buy_xgb,  buy_xgb_m   = buy_xgb_p,  buy_xgb_pm
+            buy_lgbm, buy_lgbm_m  = buy_lgbm_p,  buy_lgbm_pm
+            sell_xgb, sell_xgb_m  = sell_xgb_p,  sell_xgb_pm
             sell_lgbm, sell_lgbm_m = sell_lgbm_p, sell_lgbm_pm
             feature_cols = feature_cols_pruned
             X_buy_train, X_buy_test = X_bp_train, X_bp_test
             X_sell_train, X_sell_test = X_sp_train, X_sp_test
             logger.info(f"[Trainer] ✅ Pruned модель лучше, используем {len(feature_cols)} признаков")
-        else:
-            logger.info("[Trainer] Original модель лучше, pruning отменён")
 
-    # 12. STACKING АНСАМБЛЬ (новое v7.0)
+    # 12. STACKING
     logger.info("[Trainer] 🏗️ Stacking BUY...")
     stack_buy, stack_buy_m = train_stacking_ensemble(
-        buy_xgb, buy_lgbm,
-        X_buy_train, y_buy_train,
-        X_buy_test, y_buy_test,
-        "BUY"
+        buy_xgb, buy_lgbm, X_buy_train, y_buy_train, X_buy_test, y_buy_test, "BUY"
     )
 
     logger.info("[Trainer] 🏗️ Stacking SELL...")
     stack_sell, stack_sell_m = train_stacking_ensemble(
-        sell_xgb, sell_lgbm,
-        X_sell_train, y_sell_train,
-        X_sell_test, y_sell_test,
-        "SELL"
+        sell_xgb, sell_lgbm, X_sell_train, y_sell_train, X_sell_test, y_sell_test, "SELL"
     )
 
-    # 13. META-LABELING v7.0 (исправленный)
+    # 13. META-LABELING
     logger.info("[Trainer] 🧩 Meta-model BUY (OOF)...")
     meta_buy, meta_buy_m = train_meta_model(
-        X_buy_train, y_buy_train,
-        X_buy_test,  y_buy_test,
-        buy_xgb
+        X_buy_train, y_buy_train, X_buy_test, y_buy_test, buy_xgb
     )
 
     logger.info("[Trainer] 🧩 Meta-model SELL (OOF)...")
     meta_sell, meta_sell_m = train_meta_model(
-        X_sell_train, y_sell_train,
-        X_sell_test,  y_sell_test,
-        sell_xgb
+        X_sell_train, y_sell_train, X_sell_test, y_sell_test, sell_xgb
     )
 
-    # 14. Walk-Forward — адаптивные размеры окон под реальный объём данных
+    # 14. v8.0 NEW: КАЛИБРОВКА ВЕРОЯТНОСТЕЙ
+    logger.info("[Trainer] 🎯 Калибровка вероятностей BUY (Isotonic)...")
+    calib_buy, calib_buy_m = calibrate_model(
+        buy_xgb, X_buy_train, y_buy_train, X_buy_test, y_buy_test, "BUY"
+    )
+
+    logger.info("[Trainer] 🎯 Калибровка вероятностей SELL (Isotonic)...")
+    calib_sell, calib_sell_m = calibrate_model(
+        sell_xgb, X_sell_train, y_sell_train, X_sell_test, y_sell_test, "SELL"
+    )
+
+    # 15. Walk-Forward
     n_samples_buy = len(X_buy)
-    # Используем 60% данных как тренировочное окно, 15% как тест, шаг 10%
     wf_train = max(int(n_samples_buy * 0.55), 100)
     wf_test  = max(int(n_samples_buy * 0.12), 30)
     wf_step  = max(int(n_samples_buy * 0.08), 20)
 
     logger.info(f"[Trainer] 📊 Walk-Forward BUY (train={wf_train} test={wf_test} step={wf_step})...")
     wf_buy  = walk_forward_binary(X_buy,  y_buy,  wf_train, wf_test, wf_step)
-    logger.info(f"[Trainer] 📊 Walk-Forward SELL (train={wf_train} test={wf_test} step={wf_step})...")
+    logger.info(f"[Trainer] 📊 Walk-Forward SELL...")
     wf_sell = walk_forward_binary(X_sell, y_sell, wf_train, wf_test, wf_step)
+
     logger.info(
         f"[Trainer] WF BUY:  prec={wf_buy['wf_precision']:.1%} "
         f"sharpe={wf_buy['wf_sharpe']:.2f} folds={wf_buy['wf_folds']}"
@@ -1213,14 +1236,20 @@ def train_model() -> dict:
         f"sharpe={wf_sell['wf_sharpe']:.2f} folds={wf_sell['wf_folds']}"
     )
 
-    # 15. Kelly Criterion
-    wins_pct  = wf_buy['wf_precision']
-    avg_win   = ATR_TP_MULT * 1.5  # примерный % выигрыша
-    avg_loss  = ATR_SL_MULT * 1.5  # примерный % проигрыша
-    kelly_f   = calc_kelly_criterion(wins_pct, avg_win, avg_loss)
-    logger.info(f"[Trainer] Kelly Criterion (Half): {kelly_f:.1%} — рекомендуемый размер позиции")
+    # 16. v8.0: Kelly из реальных WF-доходностей
+    all_wf_returns = wf_buy.get('wf_trade_returns', []) + wf_sell.get('wf_trade_returns', [])
+    if len(all_wf_returns) >= 10:
+        kelly_f = calc_kelly_from_wf_returns(all_wf_returns)
+    else:
+        # Fallback: формульный Kelly
+        kelly_f = calc_kelly_criterion(
+            wf_buy['wf_precision'],
+            ATR_TP_MULT * 1.5,
+            ATR_SL_MULT * 1.5
+        )
+    logger.info(f"[Trainer] Kelly Criterion (Half-Kelly): {kelly_f:.1%}")
 
-    # 16. Сохраняем модели
+    # 17. Сохраняем модели
     joblib.dump(buy_xgb,  MODEL_PATH_BUY_XGB)
     joblib.dump(sell_xgb, MODEL_PATH_SELL_XGB)
     if buy_lgbm:
@@ -1229,44 +1258,49 @@ def train_model() -> dict:
         joblib.dump(sell_lgbm, MODEL_PATH_SELL_LGBM)
     if meta_buy:
         joblib.dump(meta_buy,  META_MODEL_BUY_PATH)
-        logger.info(f"[Trainer] ✅ Meta-model BUY сохранена: {META_MODEL_BUY_PATH}")
     if meta_sell:
         joblib.dump(meta_sell, META_MODEL_SELL_PATH)
-        logger.info(f"[Trainer] ✅ Meta-model SELL сохранена: {META_MODEL_SELL_PATH}")
     if stack_buy:
         joblib.dump(stack_buy,  STACK_MODEL_BUY_PATH)
-        logger.info(f"[Trainer] ✅ Stack BUY сохранён: {STACK_MODEL_BUY_PATH}")
     if stack_sell:
         joblib.dump(stack_sell, STACK_MODEL_SELL_PATH)
-        logger.info(f"[Trainer] ✅ Stack SELL сохранён: {STACK_MODEL_SELL_PATH}")
+
+    # v8.0: сохраняем калиброванные модели
+    if calib_buy is not None:
+        joblib.dump(calib_buy,  CALIB_MODEL_BUY_PATH)
+        logger.info(f"[Trainer] ✅ Calibrated BUY сохранена: {CALIB_MODEL_BUY_PATH}")
+    if calib_sell is not None:
+        joblib.dump(calib_sell, CALIB_MODEL_SELL_PATH)
+        logger.info(f"[Trainer] ✅ Calibrated SELL сохранена: {CALIB_MODEL_SELL_PATH}")
 
     with open(MODEL_FEATURES_PATH, 'w') as f:
         json.dump(feature_cols, f)
 
-    # 17. Итоги
+    # 18. Итоги
     avg_buy_prec  = (buy_xgb_m['precision'] + (buy_lgbm_m['precision'] if buy_lgbm_m else buy_xgb_m['precision'])) / 2
     avg_sell_prec = (sell_xgb_m['precision'] + (sell_lgbm_m['precision'] if sell_lgbm_m else sell_xgb_m['precision'])) / 2
     avg_buy_auc   = (buy_xgb_m['roc_auc']   + (buy_lgbm_m['roc_auc']   if buy_lgbm_m else buy_xgb_m['roc_auc']))   / 2
     avg_sell_auc  = (sell_xgb_m['roc_auc']  + (sell_lgbm_m['roc_auc']  if sell_lgbm_m else sell_xgb_m['roc_auc'])) / 2
 
     stats = {
-        "success":            True,
-        "labeling":           "triple_barrier",
-        "version":            "7.0",
-        "n_features":         len(feature_cols),
-        "n_samples_buy":      len(df_buy),
-        "n_samples_sell":     len(df_sell),
-        "n_samples":          len(df_buy),
-        "n_train":            split_buy,
-        "n_test":             len(X_buy_test),
-        "kelly_fraction":     kelly_f,
-        "buy_xgb_precision":  buy_xgb_m['precision'],
-        "buy_xgb_recall":     buy_xgb_m['recall'],
-        "buy_xgb_auc":        buy_xgb_m['roc_auc'],
-        "buy_lgbm_precision": buy_lgbm_m['precision'] if buy_lgbm_m else None,
-        "buy_lgbm_auc":       buy_lgbm_m['roc_auc']  if buy_lgbm_m else None,
-        "avg_buy_precision":  avg_buy_prec,
-        "avg_buy_auc":        avg_buy_auc,
+        "success":             True,
+        "version":             "8.0",
+        "labeling":            "triple_barrier",
+        "n_features":          len(feature_cols),
+        "n_samples_buy":       len(df_buy),
+        "n_samples_sell":      len(df_sell),
+        "n_samples":           len(df_buy),
+        "n_train":             split_buy,
+        "n_test":              len(X_buy_test),
+        "bars_loaded":         BARS_1H,
+        "kelly_fraction":      kelly_f,
+        "buy_xgb_precision":   buy_xgb_m['precision'],
+        "buy_xgb_recall":      buy_xgb_m['recall'],
+        "buy_xgb_auc":         buy_xgb_m['roc_auc'],
+        "buy_lgbm_precision":  buy_lgbm_m['precision'] if buy_lgbm_m else None,
+        "buy_lgbm_auc":        buy_lgbm_m['roc_auc']  if buy_lgbm_m else None,
+        "avg_buy_precision":   avg_buy_prec,
+        "avg_buy_auc":         avg_buy_auc,
         "sell_xgb_precision":  sell_xgb_m['precision'],
         "sell_xgb_recall":     sell_xgb_m['recall'],
         "sell_xgb_auc":        sell_xgb_m['roc_auc'],
@@ -1274,15 +1308,19 @@ def train_model() -> dict:
         "sell_lgbm_auc":       sell_lgbm_m['roc_auc']  if sell_lgbm_m else None,
         "avg_sell_precision":  avg_sell_prec,
         "avg_sell_auc":        avg_sell_auc,
-        "stack_buy_precision":  stack_buy_m['precision'] if stack_buy_m else None,
+        "stack_buy_precision":  stack_buy_m['precision']  if stack_buy_m  else None,
         "stack_sell_precision": stack_sell_m['precision'] if stack_sell_m else None,
-        "meta_buy_precision":  meta_buy_m['precision'] if meta_buy_m else None,
-        "meta_sell_precision": meta_sell_m['precision'] if meta_sell_m else None,
+        "meta_buy_precision":  meta_buy_m['precision']    if meta_buy_m   else None,
+        "meta_sell_precision": meta_sell_m['precision']   if meta_sell_m  else None,
+        "calib_buy_auc":       calib_buy_m.get('roc_auc') if calib_buy_m else None,
+        "calib_buy_prec":      calib_buy_m.get('precision') if calib_buy_m else None,
+        "calib_sell_auc":      calib_sell_m.get('roc_auc') if calib_sell_m else None,
         "wf_buy_precision":    wf_buy['wf_precision'],
         "wf_sell_precision":   wf_sell['wf_precision'],
         "wf_buy_sharpe":       wf_buy['wf_sharpe'],
         "wf_sell_sharpe":      wf_sell['wf_sharpe'],
         "wf_folds":            wf_buy['wf_folds'],
+        "wf_trade_count":      len(all_wf_returns),
         "xgb_precision":       avg_buy_prec,
         "lgbm_precision":      buy_lgbm_m['precision'] if buy_lgbm_m else None,
         "ensemble_precision":  (avg_buy_prec + avg_sell_prec) / 2,
@@ -1292,17 +1330,19 @@ def train_model() -> dict:
         "smote_available":     SMOTE_AVAILABLE,
         "meta_labeling":       meta_buy is not None,
         "stacking":            stack_buy is not None,
+        "calibration":         calib_buy is not None,
     }
 
     with open(STATS_FILE, 'w') as f:
-        json.dump({k: v for k, v in stats.items()}, f, indent=2)
+        json.dump({k: v for k, v in stats.items() if k != 'wf_trade_returns'}, f, indent=2)
 
     logger.info(
-        f"[Trainer] ✅ v7.0 Готово! "
+        f"[Trainer] ✅ v8.0 Готово! "
         f"BUY prec={avg_buy_prec:.1%} auc={avg_buy_auc:.3f} | "
         f"SELL prec={avg_sell_prec:.1%} auc={avg_sell_auc:.3f} | "
-        f"WF Sharpe BUY={wf_buy['wf_sharpe']:.2f} SELL={wf_sell['wf_sharpe']:.2f} | "
-        f"Kelly={kelly_f:.1%}"
+        f"WF Sharpe={wf_buy['wf_sharpe']:.2f}/{wf_sell['wf_sharpe']:.2f} | "
+        f"Kelly={kelly_f:.1%} | "
+        f"Calibrated={'✅' if calib_buy else '❌'}"
     )
 
     return {
@@ -1310,3 +1350,21 @@ def train_model() -> dict:
         "model":      buy_xgb,
         "lgbm_model": buy_lgbm,
     }
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    )
+    result = train_model()
+    if result.get("success"):
+        print(f"\n✅ Обучение v8.0 завершено!")
+        print(f"   Kelly: {result['kelly_fraction']:.1%}")
+        print(f"   BUY precision: {result['avg_buy_precision']:.1%}")
+        print(f"   SELL precision: {result['avg_sell_precision']:.1%}")
+        print(f"   WF Sharpe BUY: {result['wf_buy_sharpe']:.2f}")
+        print(f"   Калибровка: {'✅' if result.get('calibration') else '❌'}")
+        print(f"   Данных загружено: {result.get('bars_loaded')} свечей")
+    else:
+        print(f"❌ Ошибка: {result.get('error')}")

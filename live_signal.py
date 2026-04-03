@@ -1,24 +1,26 @@
 """
-live_signal.py v4.1 — Многомодельный сигнал с Multi-TF фильтрацией
-ИСПРАВЛЕНО v4.1:
-  - Консенсус-фильтр смягчён: блокирует только если XGB и LGBM дают РАЗНЫЕ торговые сигналы
-    (XGB=BUY, LGBM=SELL), но не блокирует если один говорит HOLD
-  - 4H фильтр смягчён: RSI порог расширен (40/60 вместо 45/55)
-  - Уверенность при HOLD теперь берётся из max(ensemble_probs) для корректного логирования
+live_signal.py v5.0 — Двойные бинарные классификаторы
+АРХИТЕКТУРА:
+  - BUY-модель:  p_buy  = avg(XGB_buy_proba,  LGBM_buy_proba)
+  - SELL-модель: p_sell = avg(XGB_sell_proba, LGBM_sell_proba)
+  - Сигнал: если p_buy > MIN_CONFIDENCE → BUY, p_sell > MIN_CONFIDENCE → SELL
+  - Динамический порог: торгуем только топ-35% сигналов по уверенности
+  - Все прежние фильтры: ADX, 4H MTF, BTC macro
 """
 
 import ccxt
-import pandas as pd
-import numpy as np
-import logging
-import joblib
 import json
+import joblib
+import logging
 import os
-import time
+import numpy as np
+import pandas as pd
 
 from config import (
-    MODEL_PATH, MODEL_PATH_LGBM,
-    FEATURE_COLS, FEATURE_COLS_LEGACY,
+    MODEL_PATH_BUY_XGB, MODEL_PATH_BUY_LGBM,
+    MODEL_PATH_SELL_XGB, MODEL_PATH_SELL_LGBM,
+    MODEL_FEATURES_PATH, FEATURE_COLS, FEATURE_COLS_LEGACY,
+    MIN_CONFIDENCE, CONFIDENCE_PERCENTILE,
     MTF_ENABLED, BTC_FILTER_ENABLED, BTC_CORRELATION_THRESH,
     REGIME_FILTER_ENABLED, REGIME_ADX_THRESHOLD
 )
@@ -26,6 +28,10 @@ from config import (
 logger = logging.getLogger(__name__)
 
 OKX_CONFIG = {'options': {'defaultType': 'spot'}, 'timeout': 30000}
+
+# Скользящий буфер уверенности для перцентильного фильтра
+_confidence_history = []
+_HISTORY_MAX = 48   # 48 часов
 
 
 def _get_exchange():
@@ -40,18 +46,17 @@ def _to_df(ohlcv: list) -> pd.DataFrame:
 
 
 def load_feature_cols() -> list:
-    features_path = MODEL_PATH.replace('.pkl', '_features.json')
-    if os.path.exists(features_path):
-        with open(features_path) as f:
+    if os.path.exists(MODEL_FEATURES_PATH):
+        with open(MODEL_FEATURES_PATH) as f:
             cols = json.load(f)
-        logger.info(f"[Signal] Загружено {len(cols)} фичей из {features_path}")
+        logger.info(f"[Signal] Загружено {len(cols)} фичей из {MODEL_FEATURES_PATH}")
         return cols
     logger.warning("[Signal] features.json не найден — используем FEATURE_COLS из config")
     return FEATURE_COLS
 
 
 def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
+    d     = df.copy()
     close = d['Close']
     high  = d['High']
     low   = d['Low']
@@ -74,17 +79,17 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['MACD_signal'] = d['MACD'].ewm(span=9, adjust=False).mean()
     d['MACD_hist']   = d['MACD'] - d['MACD_signal']
 
-    tr    = pd.concat([
+    tr  = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low  - close.shift()).abs()
     ], axis=1).max(axis=1)
-    atr14        = tr.ewm(com=13, min_periods=14).mean()
-    atr50        = tr.ewm(com=49, min_periods=50).mean()
-    d['ATR']     = atr14
-    d['ATR_pct'] = (atr14 / (close + 1e-9)) * 100
+    atr14         = tr.ewm(com=13, min_periods=14).mean()
+    atr50         = tr.ewm(com=49, min_periods=50).mean()
+    d['ATR']      = atr14
+    d['ATR_pct']  = (atr14 / (close + 1e-9)) * 100
     d['ATR_norm'] = atr14 / (close + 1e-9)
-    d['ATR_ratio'] = atr14 / (atr50 + 1e-9)
+    d['ATR_ratio']= atr14 / (atr50 + 1e-9)
 
     sma20        = close.rolling(20).mean()
     std20        = close.rolling(20).std()
@@ -103,25 +108,25 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     vol_sma20      = vol.rolling(20).mean()
     d['Vol_ratio'] = vol / (vol_sma20 + 1e-9)
 
-    obv        = (np.sign(close.diff()) * vol).fillna(0).cumsum()
-    obv_sma20  = obv.rolling(20).mean()
+    obv           = (np.sign(close.diff()) * vol).fillna(0).cumsum()
+    obv_sma20     = obv.rolling(20).mean()
     d['OBV_norm'] = (obv - obv_sma20) / (obv.rolling(20).std() + 1e-9)
 
-    tp       = (high + low + close) / 3
-    mf       = tp * vol
-    pos_mf   = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
-    neg_mf   = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
-    d['MFI_14'] = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
+    tp            = (high + low + close) / 3
+    mf            = tp * vol
+    pos_mf        = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
+    neg_mf        = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
+    d['MFI_14']   = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
 
-    rsi14     = d['RSI_14']
-    stoch_min = rsi14.rolling(14).min()
-    stoch_max = rsi14.rolling(14).max()
-    stoch_k   = (rsi14 - stoch_min) / (stoch_max - stoch_min + 1e-9) * 100
+    rsi14           = d['RSI_14']
+    stoch_min       = rsi14.rolling(14).min()
+    stoch_max       = rsi14.rolling(14).max()
+    stoch_k         = (rsi14 - stoch_min) / (stoch_max - stoch_min + 1e-9) * 100
     d['StochRSI_K'] = stoch_k
     d['StochRSI_D'] = stoch_k.rolling(3).mean()
 
-    hw14 = high.rolling(14).max()
-    lw14 = low.rolling(14).min()
+    hw14           = high.rolling(14).max()
+    lw14           = low.rolling(14).min()
     d['WilliamsR'] = (hw14 - close) / (hw14 - lw14 + 1e-9) * -100
 
     d['ZScore_20'] = (close - close.rolling(20).mean()) / (close.rolling(20).std() + 1e-9)
@@ -131,16 +136,15 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     down = -low.diff()
     pdm  = up.where((up > down)   & (up > 0),   0)
     mdm  = down.where((down > up) & (down > 0), 0)
-    pdi  = 100 * (pdm.ewm(alpha=1 / 14).mean() / (atr14 + 1e-9))
-    mdi  = 100 * (mdm.ewm(alpha=1 / 14).mean() / (atr14 + 1e-9))
+    pdi  = 100 * (pdm.ewm(alpha=1/14).mean() / (atr14 + 1e-9))
+    mdi  = 100 * (mdm.ewm(alpha=1/14).mean() / (atr14 + 1e-9))
     dx   = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
-    d['ADX'] = dx.ewm(alpha=1 / 14).mean()
+    d['ADX'] = dx.ewm(alpha=1/14).mean()
 
     d['Body_pct']   = (close - d['Open']).abs() / (d['Open'] + 1e-9) * 100
-    d['Upper_wick'] = (high - d[['Close', 'Open']].max(axis=1)) / (d['Open'] + 1e-9) * 100
-    d['Lower_wick'] = (d[['Close', 'Open']].min(axis=1) - low) / (d['Open'] + 1e-9) * 100
-    body_range      = (high - low + 1e-9)
-    d['Doji']       = (d['Body_pct'] / body_range < 0.1).astype(int)
+    d['Upper_wick'] = (high - d[['Close','Open']].max(axis=1)) / (d['Open'] + 1e-9) * 100
+    d['Lower_wick'] = (d[['Close','Open']].min(axis=1) - low) / (d['Open'] + 1e-9) * 100
+    d['Doji']       = ((d['Body_pct'] / (high - low + 1e-9)) < 0.1).astype(int)
 
     d['Momentum_10'] = close - close.shift(10)
     d['ROC_10']      = close.pct_change(10) * 100
@@ -152,7 +156,7 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
-    d = df4h.copy()
+    d     = df4h.copy()
     close = d['Close']
     high  = d['High']
     low   = d['Low']
@@ -191,14 +195,14 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     down = -low.diff()
     pdm  = up.where((up > down)   & (up > 0),   0)
     mdm  = down.where((down > up) & (down > 0), 0)
-    pdi  = 100 * (pdm.ewm(alpha=1 / 14).mean() / (atr14 + 1e-9))
-    mdi  = 100 * (mdm.ewm(alpha=1 / 14).mean() / (atr14 + 1e-9))
+    pdi  = 100 * (pdm.ewm(alpha=1/14).mean() / (atr14 + 1e-9))
+    mdi  = 100 * (mdm.ewm(alpha=1/14).mean() / (atr14 + 1e-9))
     dx   = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
-    d['ADX_4h'] = dx.ewm(alpha=1 / 14).mean()
+    d['ADX_4h'] = dx.ewm(alpha=1/14).mean()
 
     sma20 = close.rolling(20).mean()
     std20 = close.rolling(20).std()
-    d['BB_pos_4h'] = (close - (sma20 - 2 * std20)) / (4 * std20 + 1e-9)
+    d['BB_pos_4h'] = (close - (sma20 - 2*std20)) / (4*std20 + 1e-9)
 
     return d.dropna()
 
@@ -208,31 +212,57 @@ def get_btc_4h_change(exchange) -> float:
         ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe='4h', limit=5)
         if not ohlcv or len(ohlcv) < 2:
             return 0.0
-        prev_close = float(ohlcv[-2][4])
-        last_close = float(ohlcv[-1][4])
-        return (last_close - prev_close) / prev_close * 100
+        return (float(ohlcv[-1][4]) - float(ohlcv[-2][4])) / float(ohlcv[-2][4]) * 100
     except Exception as e:
-        logger.warning(f"[Signal] BTC фильтр — ошибка: {e}")
+        logger.warning(f"[Signal] BTC: {e}")
         return 0.0
+
+
+def _percentile_filter(confidence: float) -> bool:
+    """Возвращает True если уверенность выше порогового перцентиля."""
+    global _confidence_history
+    _confidence_history.append(confidence)
+    if len(_confidence_history) > _HISTORY_MAX:
+        _confidence_history = _confidence_history[-_HISTORY_MAX:]
+
+    if len(_confidence_history) < 10:
+        return True   # мало истории — пропускаем фильтр
+
+    threshold = np.percentile(_confidence_history, CONFIDENCE_PERCENTILE)
+    return confidence >= threshold
+
+
+def _load_models() -> dict:
+    """Загружает все 4 бинарные модели."""
+    models = {}
+
+    for key, path in [
+        ('buy_xgb',   MODEL_PATH_BUY_XGB),
+        ('buy_lgbm',  MODEL_PATH_BUY_LGBM),
+        ('sell_xgb',  MODEL_PATH_SELL_XGB),
+        ('sell_lgbm', MODEL_PATH_SELL_LGBM),
+    ]:
+        if os.path.exists(path):
+            try:
+                models[key] = joblib.load(path)
+            except Exception as e:
+                logger.warning(f"[Signal] Не удалось загрузить {path}: {e}")
+
+    return models
 
 
 def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
     try:
-        if not os.path.exists(MODEL_PATH):
-            logger.warning(f"[Signal] XGBoost модель не найдена: {MODEL_PATH}")
+        # 1. Загружаем модели
+        models = _load_models()
+
+        if 'buy_xgb' not in models and 'sell_xgb' not in models:
+            logger.warning("[Signal] Модели не найдены")
             return None
-
-        xgb_model = joblib.load(MODEL_PATH)
-
-        lgbm_model = None
-        if os.path.exists(MODEL_PATH_LGBM):
-            try:
-                lgbm_model = joblib.load(MODEL_PATH_LGBM)
-            except Exception:
-                pass
 
         feature_cols = load_feature_cols()
 
+        # 2. Данные
         exchange = _get_exchange()
         ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
 
@@ -240,9 +270,7 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             logger.warning("[Signal] Мало 1H данных")
             return None
 
-        df1h = _to_df(ohlcv_1h)
-        df1h_feats = calc_indicators_1h(df1h)
-
+        df1h_feats = calc_indicators_1h(_to_df(ohlcv_1h))
         if df1h_feats.empty:
             return None
 
@@ -251,157 +279,135 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             try:
                 ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=100)
                 if ohlcv_4h and len(ohlcv_4h) >= 50:
-                    df4h = _to_df(ohlcv_4h)
-                    df4h_feats = calc_indicators_4h(df4h)
+                    df4h_feats = calc_indicators_4h(_to_df(ohlcv_4h))
             except Exception as e:
-                logger.warning(f"[Signal] 4H данные — ошибка: {e}")
+                logger.warning(f"[Signal] 4H ошибка: {e}")
 
+        # 3. Вектор фичей
         last_1h  = df1h_feats.iloc[-1]
         row_data = {}
-
         for col in feature_cols:
             if col in df1h_feats.columns:
                 row_data[col] = float(last_1h[col])
-            elif col.endswith('_4h') or col.endswith('_4h_tf'):
-                if df4h_feats is not None and col in df4h_feats.columns:
-                    row_data[col] = float(df4h_feats.iloc[-1][col])
-                else:
-                    row_data[col] = 0.0
+            elif (col.endswith('_4h') or col.endswith('_4h_tf')) and df4h_feats is not None:
+                row_data[col] = float(df4h_feats.iloc[-1][col]) if col in df4h_feats.columns else 0.0
             else:
                 row_data[col] = 0.0
 
         X = np.array([[row_data[c] for c in feature_cols]], dtype=np.float32)
 
-        xgb_pred  = int(xgb_model.predict(X)[0])
-        xgb_probs = xgb_model.predict_proba(X)[0]
+        # 4. Вероятности от бинарных моделей
+        # BUY
+        p_buy_list = []
+        if 'buy_xgb' in models:
+            p_buy_list.append(float(models['buy_xgb'].predict_proba(X)[0][1]))
+        if 'buy_lgbm' in models:
+            p_buy_list.append(float(models['buy_lgbm'].predict_proba(X)[0][1]))
+        p_buy = float(np.mean(p_buy_list)) if p_buy_list else 0.0
 
-        lgbm_pred  = None
-        lgbm_probs = None
-        if lgbm_model is not None:
-            try:
-                lgbm_pred  = int(lgbm_model.predict(X)[0])
-                lgbm_probs = lgbm_model.predict_proba(X)[0]
-            except Exception as e:
-                logger.warning(f"[Signal] LGBM предсказание — ошибка: {e}")
+        # SELL
+        p_sell_list = []
+        if 'sell_xgb' in models:
+            p_sell_list.append(float(models['sell_xgb'].predict_proba(X)[0][1]))
+        if 'sell_lgbm' in models:
+            p_sell_list.append(float(models['sell_lgbm'].predict_proba(X)[0][1]))
+        p_sell = float(np.mean(p_sell_list)) if p_sell_list else 0.0
 
-        if lgbm_probs is not None:
-            ensemble_probs = (xgb_probs + lgbm_probs) / 2.0
-            models_used    = "XGB+LGBM"
+        models_used = "+".join(
+            ([f"XGB"] if 'buy_xgb' in models else []) +
+            ([f"LGBM"] if 'buy_lgbm' in models else [])
+        )
+
+        # 5. Определяем сигнал
+        # Если оба сильные — берём максимальный
+        if p_buy >= MIN_CONFIDENCE and p_sell >= MIN_CONFIDENCE:
+            if p_buy >= p_sell:
+                signal, confidence = "BUY", p_buy
+            else:
+                signal, confidence = "SELL", p_sell
+        elif p_buy >= MIN_CONFIDENCE:
+            signal, confidence = "BUY", p_buy
+        elif p_sell >= MIN_CONFIDENCE:
+            signal, confidence = "SELL", p_sell
         else:
-            ensemble_probs = xgb_probs
-            models_used    = "XGB"
+            signal, confidence = "HOLD", max(p_buy, p_sell)
 
-        pred_class = int(np.argmax(ensemble_probs))
-        confidence = float(np.max(ensemble_probs))
-
-        signal_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
-        signal     = signal_map.get(pred_class, "HOLD")
-
-        # ИСПРАВЛЕНО: консенсус блокирует только при ПРЯМОМ ПРОТИВОРЕЧИИ (BUY vs SELL)
-        # XGB=HOLD, LGBM=BUY → разрешаем (ансамбль решает по вероятностям)
-        # XGB=BUY,  LGBM=SELL → блокируем (противоположные сигналы)
-        xgb_signal  = signal_map.get(xgb_pred, "HOLD")
-        lgbm_signal = signal_map.get(lgbm_pred, "HOLD") if lgbm_pred is not None else "HOLD"
-
-        if lgbm_pred is not None and signal != "HOLD":
-            direct_conflict = (
-                (xgb_signal == "BUY"  and lgbm_signal == "SELL") or
-                (xgb_signal == "SELL" and lgbm_signal == "BUY")
-            )
-            if direct_conflict:
+        # 6. Перцентильный фильтр
+        if signal != "HOLD":
+            if not _percentile_filter(confidence):
                 logger.info(
-                    f"[Signal] ⚠️ Прямой конфликт: XGB={xgb_signal} LGBM={lgbm_signal} → HOLD"
-                )
-                signal     = "HOLD"
-                confidence = float(ensemble_probs[0])
-
-        # Market Regime фильтр
-        adx_1h = float(last_1h.get('ADX', 25.0))
-        if REGIME_FILTER_ENABLED and signal != "HOLD":
-            if adx_1h < REGIME_ADX_THRESHOLD:
-                logger.info(
-                    f"[Signal] 🔕 Regime filter: ADX={adx_1h:.1f} < {REGIME_ADX_THRESHOLD} → HOLD"
+                    f"[Signal] 📊 Перцентильный фильтр: conf={confidence:.1%} "
+                    f"< {CONFIDENCE_PERCENTILE}th перцентиль → HOLD"
                 )
                 signal = "HOLD"
 
-        # Multi-TF 4H фильтр
-        mtf_confirmed   = True
-        mtf_description = "N/A"
+        # 7. ADX фильтр
+        adx_1h = float(last_1h.get('ADX', 25.0))
+        if REGIME_FILTER_ENABLED and signal != "HOLD" and adx_1h < REGIME_ADX_THRESHOLD:
+            logger.info(f"[Signal] 🔕 ADX={adx_1h:.1f} < {REGIME_ADX_THRESHOLD} → HOLD")
+            signal = "HOLD"
 
+        # 8. Multi-TF 4H фильтр
+        mtf_confirmed = True
         if MTF_ENABLED and df4h_feats is not None and signal != "HOLD":
             last_4h      = df4h_feats.iloc[-1]
             rsi_4h       = float(last_4h.get('RSI_14_4h', 50))
             ema_ratio_4h = float(last_4h.get('EMA_ratio_4h', 1.0))
-            adx_4h       = float(last_4h.get('ADX_4h', 25))
 
-            # ИСПРАВЛЕНО: смягчены пороги RSI (было 45/55 → 40/60)
             if signal == "BUY":
                 mtf_ok = (ema_ratio_4h > 0.995) and (rsi_4h > 40)
-            else:  # SELL
+            else:
                 mtf_ok = (ema_ratio_4h < 1.005) and (rsi_4h < 60)
-
-            mtf_description = (
-                f"RSI_4h={rsi_4h:.1f} "
-                f"EMA_ratio_4h={ema_ratio_4h:.4f} "
-                f"ADX_4h={adx_4h:.1f}"
-            )
 
             if not mtf_ok:
                 logger.info(
-                    f"[Signal] 🔕 4H фильтр отклонил {signal}: {mtf_description}"
+                    f"[Signal] 🔕 4H фильтр: RSI={rsi_4h:.1f} "
+                    f"EMA_ratio={ema_ratio_4h:.4f} → HOLD"
                 )
                 signal        = "HOLD"
                 mtf_confirmed = False
 
-        # BTC macro-фильтр
+        # 9. BTC macro-фильтр
         btc_change  = 0.0
         btc_blocked = False
-
         if BTC_FILTER_ENABLED and signal == "BUY":
             btc_change = get_btc_4h_change(exchange)
             if btc_change < BTC_CORRELATION_THRESH:
-                logger.info(
-                    f"[Signal] 🔕 BTC macro-фильтр: BTC 4H = {btc_change:+.2f}% → блок BUY"
-                )
+                logger.info(f"[Signal] 🔕 BTC 4H={btc_change:+.2f}% → блок BUY")
                 signal      = "HOLD"
                 btc_blocked = True
 
+        # 10. Мета-данные
         cur_price   = float(last_1h['Close'])
         current_atr = float(last_1h.get('ATR', 0.0))
         change_24h  = float(last_1h.get('Return_24h', 0.0))
         volume      = float(last_1h.get('Volume', 0.0))
 
-        p_hold = float(ensemble_probs[0])
-        p_buy  = float(ensemble_probs[1])
-        p_sell = float(ensemble_probs[2])
-
         logger.info(
             f"[Signal] {signal} | "
-            f"HOLD={p_hold:.1%} BUY={p_buy:.1%} SELL={p_sell:.1%} | "
+            f"p_buy={p_buy:.1%} p_sell={p_sell:.1%} | "
             f"Conf={confidence:.1%} | Models={models_used} | "
             f"ADX={adx_1h:.1f} | 4H={'✅' if mtf_confirmed else '❌'} | "
-            f"BTC_4h={btc_change:+.2f}% | "
-            f"Price=${cur_price:.4f}"
+            f"BTC={btc_change:+.2f}% | Price=${cur_price:.4f}"
         )
 
         return {
             "signal":        signal,
             "confidence":    confidence,
-            "price":         cur_price,
-            "p_hold":        p_hold,
             "p_buy":         p_buy,
             "p_sell":        p_sell,
-            "change_24h":    change_24h,
+            "price":         cur_price,
             "atr":           current_atr,
+            "change_24h":    change_24h,
             "volume":        volume,
             "adx":           adx_1h,
             "models_used":   models_used,
             "mtf_confirmed": mtf_confirmed,
-            "mtf_info":      mtf_description,
             "btc_change_4h": btc_change,
             "btc_blocked":   btc_blocked,
-            "xgb_signal":    xgb_signal,
-            "lgbm_signal":   lgbm_signal,
+            # Совместимость с app.py
+            "xgb_signal":    signal,
+            "lgbm_signal":   signal,
         }
 
     except Exception as e:

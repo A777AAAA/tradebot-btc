@@ -1,14 +1,10 @@
 """
-TradeBot v4.0 — Multi-TF Ensemble Edition
-v4.0 изменения:
-  - Ансамбль XGBoost + LightGBM (консенсус)
-  - Multi-timeframe: 1H сигнал + 4H фильтр
-  - BTC macro-фильтр
-  - Market Regime (ADX) фильтр
-  - Trailing Stop-Loss + Breakeven
-  - 40+ признаков
-  - Walk-Forward переобучение
-  - Расширенный Telegram-отчёт с информацией о фильтрах
+TradeBot v5.0 — Dual Binary Classifier Edition
+v5.0 изменения:
+  - 2 бинарных классификатора: BUY-модель + SELL-модель (SMOTE + Optuna)
+  - Перцентильный фильтр уверенности (топ-35%)
+  - ML-бэктест (Sharpe ratio)
+  - Обновлён Telegram-отчёт
 """
 
 import threading
@@ -41,7 +37,7 @@ logger = logging.getLogger(__name__)
 PAPER_SYMBOL = SYMBOL
 
 _last_trade_time       = 0
-TRADE_COOLDOWN_SECONDS = 2 * 60 * 60   # 2 часа
+TRADE_COOLDOWN_SECONDS = 2 * 60 * 60
 
 
 # ═══════════════════════════════════════════
@@ -51,7 +47,7 @@ health_app = Flask(__name__)
 
 @health_app.route("/health")
 def health():
-    return {"status": "ok", "bot": "TradeBot v4.0"}, 200
+    return {"status": "ok", "bot": "TradeBot v5.0"}, 200
 
 @health_app.route("/")
 def index():
@@ -59,7 +55,7 @@ def index():
         stats = get_statistics()
         paper = get_stats()
         return {
-            "bot":           "TradeBot v4.0 — Multi-TF Ensemble",
+            "bot":           "TradeBot v5.0 — Dual Binary Classifiers",
             "symbol":        SYMBOL,
             "paper_balance": paper["balance"],
             "paper_winrate": paper["winrate"],
@@ -74,15 +70,15 @@ def run_health_server():
 
 
 # ═══════════════════════════════════════════
-# ОСНОВНОЙ ТОРГОВЫЙ ЦИКЛ
+# ТОРГОВЫЙ ЦИКЛ
 # ═══════════════════════════════════════════
 def trading_loop():
     global _last_trade_time
-    logger.info(f"🚀 Торговый цикл v4.0 запущен | {SYMBOL}")
+    logger.info(f"🚀 Торговый цикл v5.0 запущен | {SYMBOL}")
 
     while True:
         try:
-            # ── Шаг 1: Мониторинг открытых сделок (+ trailing) ──
+            # Мониторинг открытых сделок
             closed = monitor_trades(PAPER_SYMBOL)
             for trade in closed:
                 _last_trade_time = time.time()
@@ -104,7 +100,7 @@ def trading_loop():
                     f"{trailing_note}"
                 )
 
-            # ── Шаг 2: Cooldown ──
+            # Cooldown
             since_last = time.time() - _last_trade_time
             if since_last < TRADE_COOLDOWN_SECONDS and _last_trade_time > 0:
                 remaining = int((TRADE_COOLDOWN_SECONDS - since_last) / 60)
@@ -112,7 +108,7 @@ def trading_loop():
                 time.sleep(SIGNAL_INTERVAL_MINUTES * 60)
                 continue
 
-            # ── Шаг 3: Сигнал ансамбля ──
+            # Сигнал
             signal_data = get_live_signal()
             if not signal_data:
                 logger.warning("⚠️ Сигнал не получен")
@@ -126,23 +122,19 @@ def trading_loop():
             change_24h = signal_data.get("change_24h", 0.0)
             volume     = signal_data.get("volume",     0.0)
             adx        = signal_data.get("adx",        0.0)
-            models     = signal_data.get("models_used", "XGB")
+            p_buy      = signal_data.get("p_buy",      0.0)
+            p_sell     = signal_data.get("p_sell",     0.0)
+            models     = signal_data.get("models_used","XGB")
             mtf_ok     = signal_data.get("mtf_confirmed", True)
             btc_ch     = signal_data.get("btc_change_4h", 0.0)
-            xgb_sig    = signal_data.get("xgb_signal", "N/A")
-            lgbm_sig   = signal_data.get("lgbm_signal","N/A")
 
             logger.info(
-                f"📊 {signal} ({confidence:.1%}) | "
-                f"XGB={xgb_sig} LGBM={lgbm_sig} | "
-                f"ADX={adx:.1f} | 4H={'✅' if mtf_ok else '❌'} | "
-                f"BTC={btc_ch:+.2f}%"
+                f"📊 {signal} | p_buy={p_buy:.1%} p_sell={p_sell:.1%} | "
+                f"ADX={adx:.1f} | 4H={'✅' if mtf_ok else '❌'} | BTC={btc_ch:+.2f}%"
             )
 
-            # ── Шаг 4: Открытие ──
+            # Открытие сделки
             if signal in ("BUY", "SELL") and confidence >= MIN_CONFIDENCE:
-
-                # Sentiment boost
                 try:
                     sent  = get_market_sentiment(price, change_24h, volume)
                     boost = sentiment_to_signal_boost(sent, signal)
@@ -158,8 +150,8 @@ def trading_loop():
                     strength_label = "🔥 STRONG" if confidence >= STRONG_SIGNAL else "📶 NORMAL"
 
                     extra_info = {
-                        "xgb_signal":    xgb_sig,
-                        "lgbm_signal":   lgbm_sig,
+                        "p_buy":         p_buy,
+                        "p_sell":        p_sell,
                         "models_used":   models,
                         "mtf_confirmed": mtf_ok,
                         "btc_change_4h": btc_ch,
@@ -175,19 +167,18 @@ def trading_loop():
                     if trade:
                         _last_trade_time = time.time()
                         emoji = "🟢" if signal == "BUY" else "🔴"
-                        trade_pct_str = f"{trade['trade_pct']:.0%}"
 
                         send_message(
                             f"{emoji} <b>Новая сделка: {signal} {strength_label}</b>\n\n"
                             f"💵 Цена:          <b>${price:.4f}</b>\n"
-                            f"🎯 Уверенность:   <b>{confidence:.1%}</b>\n"
+                            f"🎯 p(BUY):        <b>{p_buy:.1%}</b>\n"
+                            f"🎯 p(SELL):       <b>{p_sell:.1%}</b>\n"
                             f"📈 24h change:    <b>{change_24h:+.2f}%</b>\n"
                             f"📐 ATR:           <b>{atr:.4f}</b>\n"
                             f"💹 ADX:           <b>{adx:.1f}</b>\n"
                             f"🤖 Модели:        <b>{models}</b>\n"
-                            f"XGB={xgb_sig} | LGBM={lgbm_sig}\n"
                             f"📊 BTC 4H:        <b>{btc_ch:+.2f}%</b>\n"
-                            f"💼 Размер:        <b>{trade_pct_str} (${trade['amount_usd']:.2f})</b>\n"
+                            f"💼 Размер:        <b>${trade['amount_usd']:.2f}</b>\n"
                             f"🛑 SL: <b>${trade['sl']:.4f}</b> | "
                             f"✅ TP: <b>${trade['tp']:.4f}</b>\n"
                             f"🔄 Trailing SL:   <b>{'Активен' if trade.get('trailing_active') else 'Ожидание +1%'}</b>"
@@ -195,7 +186,7 @@ def trading_loop():
                     else:
                         logger.info("ℹ️ Сделка не открыта (уже есть открытая)")
             else:
-                logger.info("⏸ HOLD или низкая уверенность")
+                logger.info(f"⏸ {signal} | p_buy={p_buy:.1%} p_sell={p_sell:.1%}")
 
             time.sleep(SIGNAL_INTERVAL_MINUTES * 60)
 
@@ -205,31 +196,37 @@ def trading_loop():
 
 
 # ═══════════════════════════════════════════
-# ЦИКЛ ПЕРЕОБУЧЕНИЯ
+# ПЕРЕОБУЧЕНИЕ (24ч)
 # ═══════════════════════════════════════════
 def retrainer_loop():
     time.sleep(60)
-    logger.info("🧠 Retrainer v4.0 запущен (Walk-Forward, 24ч)")
+    logger.info("🧠 Retrainer v5.0 запущен (Dual Binary + SMOTE + Optuna, 24ч)")
 
     while True:
         try:
             result = train_model()
             if result.get("success"):
-                lgbm_str = ""
-                if result.get("lgbm_precision"):
-                    lgbm_str = f"\n🌿 LightGBM:     <b>{result['lgbm_precision']:.1%}</b>"
+                buy_prec  = result.get("avg_buy_precision", 0)
+                sell_prec = result.get("avg_sell_precision", 0)
+                buy_auc   = result.get("avg_buy_auc", 0)
+                sell_auc  = result.get("avg_sell_auc", 0)
+                wf_buy    = result.get("wf_buy_precision", 0)
+                wf_sell   = result.get("wf_sell_precision", 0)
 
                 send_message(
-                    f"🧠 <b>Ансамбль переобучен! v4.0</b>\n\n"
-                    f"🎯 XGBoost:      <b>{result['xgb_precision']:.1%}</b>"
-                    f"{lgbm_str}\n"
-                    f"🏆 Ensemble:     <b>{result['ensemble_precision']:.1%}</b>\n\n"
-                    f"📊 Walk-Forward:\n"
-                    f"   Precision: <b>{result['wf_precision']:.1%}</b>\n"
-                    f"   Accuracy:  <b>{result['wf_accuracy']:.1%}</b>\n"
-                    f"   Folds:     <b>{result['wf_folds']}</b>\n\n"
-                    f"📚 Выборка:      <b>{result['n_samples']}</b> свечей\n"
-                    f"🔢 Признаков:    <b>{result.get('n_features', '?')}</b>"
+                    f"🧠 <b>Ансамбль v5.0 переобучен!</b>\n\n"
+                    f"🟢 BUY-модель:\n"
+                    f"   Precision: <b>{buy_prec:.1%}</b>\n"
+                    f"   ROC-AUC:   <b>{buy_auc:.3f}</b>\n"
+                    f"   WF prec:   <b>{wf_buy:.1%}</b>\n\n"
+                    f"🔴 SELL-модель:\n"
+                    f"   Precision: <b>{sell_prec:.1%}</b>\n"
+                    f"   ROC-AUC:   <b>{sell_auc:.3f}</b>\n"
+                    f"   WF prec:   <b>{wf_sell:.1%}</b>\n\n"
+                    f"📚 Выборка:  <b>{result['n_samples']}</b> свечей\n"
+                    f"🔢 Признаков: <b>{result.get('n_features','?')}</b>\n"
+                    f"⚗️ SMOTE:    <b>{'✅' if result.get('smote_available') else '❌'}</b>\n"
+                    f"🔬 Optuna:   <b>30 trials ✅</b>"
                 )
             else:
                 logger.warning(f"[Retrainer] Неудача: {result.get('error')}")
@@ -281,7 +278,7 @@ if __name__ == "__main__":
         logger.critical(f"❌ Не заданы переменные окружения: {errors}")
         exit(1)
 
-    logger.info("✅ Конфиг OK, запускаем TradeBot v4.0...")
+    logger.info("✅ Конфиг OK, запускаем TradeBot v5.0...")
 
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=retrainer_loop,    daemon=True).start()
@@ -290,16 +287,21 @@ if __name__ == "__main__":
     threading.Thread(target=stats_loop,        daemon=True).start()
 
     send_message(
-        "🤖 <b>TradeBot v4.0 запущен!</b>\n\n"
+        "🤖 <b>TradeBot v5.0 запущен!</b>\n\n"
         f"📊 Пара:              <b>{SYMBOL}</b>\n"
         f"⏱ Интервал:          <b>{SIGNAL_INTERVAL_MINUTES} мин</b>\n"
-        f"🎯 Мин. уверенность: <b>{MIN_CONFIDENCE:.0%}</b>\n"
-        f"🤖 Ансамбль:         <b>XGBoost + LightGBM</b>\n"
-        f"📐 Multi-TF:         <b>1H сигнал + 4H фильтр</b>\n"
-        f"₿  BTC macro:        <b>Активен</b>\n"
-        f"📊 Market Regime:    <b>ADX фильтр активен</b>\n"
-        f"🔄 Trailing SL:      <b>+1.0% breakeven / +1.5% trail</b>\n"
-        f"🔢 Признаков:        <b>40+</b>"
+        f"🎯 Мин. уверенность: <b>{MIN_CONFIDENCE:.0%}</b>\n\n"
+        f"🔬 <b>Архитектура v5.0:</b>\n"
+        f"   🟢 BUY-модель:    XGB + LGBM (бинарный)\n"
+        f"   🔴 SELL-модель:   XGB + LGBM (бинарный)\n"
+        f"   ⚗️ SMOTE:         балансировка 1:1\n"
+        f"   🔬 Optuna:        30 trials гиперпараметров\n"
+        f"   📊 Перцентиль:    топ-35% сигналов\n"
+        f"   📐 Multi-TF:      1H сигнал + 4H фильтр\n"
+        f"   ₿  BTC macro:     активен (-4% блок)\n"
+        f"   💹 ADX фильтр:    > {18} (нет сделок в боковике)\n"
+        f"   🔄 Trailing SL:   +1.0% breakeven / +1.5% trail\n"
+        f"   🔢 Признаков:     44"
     )
 
     while True:

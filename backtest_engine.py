@@ -1,11 +1,11 @@
 """
-backtest_engine.py v5.0 — ML-бэктест на реальных бинарных моделях
-ИЗМЕНЕНИЯ:
-  - Бэктест теперь использует сами ML-модели для генерации сигналов
-  - Если модели не загружены — fallback на RSI+EMA стратегию
-  - Пагинация OKX (реальные 3000 свечей)
-  - ATR-based динамические SL/TP
-  - Расчёт Sharpe ratio
+backtest_engine.py v6.0 — Правильный Sharpe + Meta-model фильтр
+ИЗМЕНЕНИЯ v6.0:
+  - Sharpe считается на ПОЧАСОВЫХ доходностях всего периода
+    (включая нулевые часы без сделок — это правильно)
+  - Поддержка meta-model: если загружена → доп. фильтр входа
+  - Max Drawdown теперь по балансу (не по сумме pnl)
+  - Добавлен Calmar Ratio = годовой доход / макс просадка
 """
 
 import requests
@@ -19,9 +19,11 @@ import time
 
 logger = logging.getLogger(__name__)
 
-MODEL_PATH_BUY_XGB  = "model_buy_xgb.pkl"
-MODEL_PATH_SELL_XGB = "model_sell_xgb.pkl"
-MODEL_FEATURES_PATH = "model_features.json"
+MODEL_PATH_BUY_XGB   = "model_buy_xgb.pkl"
+MODEL_PATH_SELL_XGB  = "model_sell_xgb.pkl"
+MODEL_FEATURES_PATH  = "model_features.json"
+META_MODEL_BUY_PATH  = "meta_model_buy.pkl"
+META_MODEL_SELL_PATH = "meta_model_sell.pkl"
 
 
 def fetch_history(symbol: str = "TON-USDT",
@@ -172,13 +174,24 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 
-def _sharpe(returns: list, periods_per_year: int = 8760) -> float:
-    if len(returns) < 2:
+def _sharpe_correct(hourly_returns: np.ndarray, periods_per_year: int = 8760) -> float:
+    """
+    Правильный Sharpe: на ВСЕХ почасовых доходностях (включая нули).
+    Если передать только доходности сделок, Sharpe будет сильно завышен.
+    """
+    if len(hourly_returns) < 2:
         return 0.0
-    r = np.array(returns)
-    if r.std() == 0:
+    mean = hourly_returns.mean()
+    std  = hourly_returns.std()
+    if std < 1e-10:
         return 0.0
-    return float(r.mean() / r.std() * np.sqrt(periods_per_year))
+    return float(mean / std * np.sqrt(periods_per_year))
+
+
+def _calmar(annual_return_pct: float, max_drawdown_pct: float) -> float:
+    if max_drawdown_pct <= 0:
+        return 0.0
+    return round(annual_return_pct / max_drawdown_pct, 2)
 
 
 def run_backtest(
@@ -189,7 +202,7 @@ def run_backtest(
     start_balance = 600.0
 ) -> dict:
 
-    logger.info(f"[Backtest] 🔍 Старт v5.0: {limit} свечей...")
+    logger.info(f"[Backtest] 🔍 Старт v6.0: {limit} свечей...")
 
     okx_symbol = symbol.replace("/", "-")
     okx_tf     = timeframe.upper()
@@ -200,9 +213,11 @@ def run_backtest(
 
     df = _add_indicators(df)
 
-    # Пробуем загрузить ML-модели
+    # Загружаем ML-модели
     buy_model  = None
     sell_model = None
+    meta_buy   = None
+    meta_sell  = None
     feature_cols = []
 
     if os.path.exists(MODEL_PATH_BUY_XGB) and os.path.exists(MODEL_FEATURES_PATH):
@@ -211,15 +226,25 @@ def run_backtest(
             sell_model = joblib.load(MODEL_PATH_SELL_XGB) if os.path.exists(MODEL_PATH_SELL_XGB) else None
             with open(MODEL_FEATURES_PATH) as f:
                 feature_cols = json.load(f)
+
+            if os.path.exists(META_MODEL_BUY_PATH):
+                meta_buy = joblib.load(META_MODEL_BUY_PATH)
+                logger.info("[Backtest] ✅ Meta-model BUY загружена")
+            if os.path.exists(META_MODEL_SELL_PATH):
+                meta_sell = joblib.load(META_MODEL_SELL_PATH)
+                logger.info("[Backtest] ✅ Meta-model SELL загружена")
+
             logger.info(f"[Backtest] ✅ ML-модели загружены ({len(feature_cols)} фичей)")
         except Exception as e:
             logger.warning(f"[Backtest] ML-модели недоступны: {e} → RSI fallback")
 
-    use_ml = buy_model is not None and len(feature_cols) > 0
+    use_ml   = buy_model is not None and len(feature_cols) > 0
+    use_meta = (meta_buy is not None or meta_sell is not None) and use_ml
 
     balance      = start_balance
     trades       = []
-    hourly_ret   = []
+    # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: храним почасовые доходности для Sharpe
+    hourly_returns = []
     in_trade     = False
     trade_signal = ""
     trade_open   = 0.0
@@ -227,14 +252,15 @@ def run_backtest(
     sl_price     = 0.0
     amount_usd   = 0.0
 
-    # Убираем первые 10% (warmup для индикаторов если ML)
     start_idx = int(len(df) * 0.10) if use_ml else 1
 
     for i in range(start_idx, len(df)):
         row  = df.iloc[i]
         prev = df.iloc[i - 1]
 
-        # Закрытие
+        hourly_pnl_pct = 0.0  # по умолчанию этот час = 0
+
+        # Закрытие позиции
         if in_trade:
             hit = None
             if trade_signal == "BUY":
@@ -257,7 +283,7 @@ def run_backtest(
 
                 pnl_usd   = amount_usd * pnl_pct / 100
                 balance  += pnl_usd
-                hourly_ret.append(pnl_pct)
+                hourly_pnl_pct = pnl_pct
 
                 trades.append({
                     "signal":  trade_signal,
@@ -266,16 +292,13 @@ def run_backtest(
                     "pnl_usd": round(pnl_usd, 2),
                 })
                 in_trade = False
-            else:
-                hourly_ret.append(0.0)
 
-        # Открытие
+        # Открытие позиции
         if not in_trade:
             signal = None
             conf   = 0.0
 
             if use_ml:
-                # ML-сигнал
                 row_data = {}
                 for col in feature_cols:
                     row_data[col] = float(row[col]) if col in df.columns else 0.0
@@ -290,6 +313,16 @@ def run_backtest(
                 elif p_sell >= 0.58 and p_sell > p_buy:
                     signal = "SELL"
                     conf   = p_sell
+
+                # Meta-model фильтр
+                if signal and use_meta:
+                    meta_model = meta_buy if signal == "BUY" else meta_sell
+                    if meta_model is not None:
+                        p_side = p_buy if signal == "BUY" else p_sell
+                        X_meta = np.hstack([X, [[p_side]]])
+                        p_meta = float(meta_model.predict_proba(X_meta)[0][1])
+                        if p_meta < 0.45:
+                            signal = None  # мета-модель не подтвердила
             else:
                 # Fallback: RSI + EMA
                 if prev['RSI_14'] < 35 and row['RSI_14'] >= 35 and row['EMA_ratio_20_50'] > 1.0:
@@ -305,7 +338,6 @@ def run_backtest(
                 sl_pct_dyn = max(0.008, min(raw_sl, 0.04))
                 tp_pct_dyn = sl_pct_dyn * 2.0
 
-                # Больший размер при высокой уверенности
                 size_mult  = 1.5 if conf >= 0.70 else 1.0
                 amount_usd = balance * trade_pct * size_mult
                 trade_open   = float(row['Close'])
@@ -319,6 +351,9 @@ def run_backtest(
                     tp_price = trade_open * (1 - tp_pct_dyn)
                     sl_price = trade_open * (1 + sl_pct_dyn)
 
+        # Записываем почасовую доходность (включая 0 для часов без события)
+        hourly_returns.append(hourly_pnl_pct)
+
     # Закрываем остаток
     if in_trade:
         last_close = float(df['Close'].iloc[-1])
@@ -328,6 +363,7 @@ def run_backtest(
             pnl_pct = (trade_open - last_close) / trade_open * 100
         pnl_usd  = amount_usd * pnl_pct / 100
         balance += pnl_usd
+        hourly_returns.append(pnl_pct)
         trades.append({
             "signal":  trade_signal,
             "result":  "WIN" if pnl_pct > 0 else "LOSS",
@@ -345,23 +381,36 @@ def run_backtest(
     total_pnl  = round(balance - start_balance, 2)
     growth_pct = round(total_pnl / start_balance * 100, 2)
 
-    # Максимальная просадка
-    peak, max_dd, running_b = start_balance, 0.0, start_balance
+    # Max Drawdown по кривой баланса (правильно)
+    balance_curve = [start_balance]
+    running_b = start_balance
     for t in trades:
         running_b += t["pnl_usd"]
-        if running_b > peak:
-            peak = running_b
-        dd = (peak - running_b) / peak * 100 if peak > 0 else 0
+        balance_curve.append(running_b)
+
+    peak, max_dd = start_balance, 0.0
+    for b in balance_curve:
+        if b > peak:
+            peak = b
+        dd = (peak - b) / peak * 100 if peak > 0 else 0
         if dd > max_dd:
             max_dd = dd
 
-    sharpe = _sharpe([t["pnl_pct"] for t in trades])
+    # Правильный Sharpe — на всех почасовых доходностях
+    hr = np.array(hourly_returns)
+    sharpe = _sharpe_correct(hr)
+
+    # Calmar Ratio
+    n_hours = len(hourly_returns)
+    years   = n_hours / 8760 if n_hours > 0 else 1
+    annual_return = growth_pct / years if years > 0 else 0
+    calmar = _calmar(annual_return, max_dd)
 
     result = {
         "success":       True,
         "symbol":        symbol,
         "candles":       len(df),
-        "mode":          "ML" if use_ml else "RSI_FALLBACK",
+        "mode":          "ML+Meta" if use_meta else ("ML" if use_ml else "RSI_FALLBACK"),
         "total_trades":  total,
         "wins":          wins,
         "losses":        losses,
@@ -371,6 +420,7 @@ def run_backtest(
         "growth_pct":    growth_pct,
         "max_drawdown":  round(max_dd, 2),
         "sharpe_ratio":  round(sharpe, 2),
+        "calmar_ratio":  calmar,
         "final_balance": round(balance, 2),
         "start_balance": start_balance,
     }
@@ -378,7 +428,7 @@ def run_backtest(
     logger.info(
         f"[Backtest] ✅ [{result['mode']}] {total} сделок | "
         f"Winrate: {winrate}% | Рост: {growth_pct:+.2f}% | "
-        f"Sharpe: {sharpe:.2f}"
+        f"Sharpe: {sharpe:.2f} | Calmar: {calmar:.2f}"
     )
     return result
 
@@ -388,9 +438,15 @@ def format_backtest_message(r: dict) -> str:
         return f"❌ Бэктест не удался: {r.get('error')}"
 
     emoji = "📈" if r["growth_pct"] >= 0 else "📉"
-    mode  = "🤖 ML-модель" if r.get("mode") == "ML" else "📐 RSI fallback"
+    mode_map = {
+        "ML+Meta": "🤖 ML + Meta-filter",
+        "ML": "🤖 ML-модель",
+        "RSI_FALLBACK": "📐 RSI fallback",
+    }
+    mode = mode_map.get(r.get("mode", ""), r.get("mode", "?"))
+
     return (
-        f"🔬 <b>Бэктест v5.0</b> {emoji}\n\n"
+        f"🔬 <b>Бэктест v6.0</b> {emoji}\n\n"
         f"⚙️ Режим:         <b>{mode}</b>\n"
         f"📊 Свечей:        <b>{r['candles']}</b>\n"
         f"📋 Сделок:        <b>{r['total_trades']}</b>\n"
@@ -403,5 +459,6 @@ def format_backtest_message(r: dict) -> str:
         f"💵 P&L:           <b>${r['total_pnl']:+.2f}</b>\n\n"
         f"📊 Средний P&L:   <b>{r['avg_pnl']:+.2f}%</b>\n"
         f"📉 Макс просадка: <b>{r['max_drawdown']:.2f}%</b>\n"
-        f"⚡ Sharpe ratio:  <b>{r['sharpe_ratio']:.2f}</b>"
+        f"⚡ Sharpe ratio:  <b>{r['sharpe_ratio']:.2f}</b>\n"
+        f"📐 Calmar ratio:  <b>{r['calmar_ratio']:.2f}</b>"
     )

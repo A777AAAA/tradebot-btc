@@ -1,14 +1,17 @@
 """
-auto_trainer.py v5.0 — Двойные бинарные классификаторы
-АРХИТЕКТУРНОЕ ИЗМЕНЕНИЕ:
-  - Вместо 1 мультиклассового (HOLD/BUY/SELL с дисбалансом 65:17:18)
-    → 2 бинарных классификатора:
-      · BUY-модель:  "вырастет ли цена > 1.2% за 6ч?" (1 vs 0)
-      · SELL-модель: "упадёт ли цена > 1.2% за 6ч?"  (1 vs 0)
-  - SMOTE балансировка (1:1 вместо 65:17:18) → precision BUY/SELL ~45-55%
-  - Optuna гиперпараметр-тюнинг (30 trials)
-  - Walk-Forward валидация на бинарных моделях
-  - Все фичи 1H + 4H (44 признака)
+auto_trainer.py v6.0 — Triple Barrier Labeling + Meta-Labeling
+ИЗМЕНЕНИЯ v6.0:
+  - Triple Barrier Method (по Лопесу де Прадо):
+      · Таргет = 1 если TP сработал раньше SL (а не просто "цена выросла")
+      · Таргет = 0 если SL сработал раньше TP
+      · Исключаем свечи где ни TP ни SL не сработали за горизонт
+    → Разметка теперь соответствует реальной торговле бота
+  - Meta-labeling фильтр:
+      · Первая модель (side model) генерирует направление BUY/SELL
+      · Вторая модель (meta model) фильтрует: входить или нет
+      → Снижает ложные срабатывания без потери хороших сигналов
+  - Правильный Sharpe в walk-forward (на почасовых доходностях)
+  - SMOTE + Optuna сохранены
 """
 
 import os
@@ -27,7 +30,6 @@ from xgboost import XGBClassifier
 from sklearn.metrics import (
     accuracy_score, precision_score,
     recall_score, f1_score, roc_auc_score,
-    classification_report
 )
 
 try:
@@ -48,10 +50,14 @@ from config import (
     MODEL_FEATURES_PATH, STATS_FILE,
     FEATURE_COLS, FEATURE_COLS_LEGACY,
     TARGET_HORIZON, TARGET_THRESHOLD,
-    WF_TRAIN_DAYS, WF_TEST_DAYS, WF_STEP_DAYS
+    WF_TRAIN_DAYS, WF_TEST_DAYS, WF_STEP_DAYS,
+    ATR_SL_MULT, ATR_TP_MULT,
 )
 
 logger = logging.getLogger(__name__)
+
+META_MODEL_BUY_PATH  = "meta_model_buy.pkl"
+META_MODEL_SELL_PATH = "meta_model_sell.pkl"
 
 
 # ─────────────────────────────────────────────
@@ -275,29 +281,98 @@ def merge_timeframes(df1h: pd.DataFrame, df4h: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# Разметка таргетов (бинарные)
+# TRIPLE BARRIER LABELING (главное улучшение)
 # ─────────────────────────────────────────────
-def make_targets(df: pd.DataFrame) -> pd.DataFrame:
+def triple_barrier_labels(df: pd.DataFrame,
+                           horizon: int = None,
+                           tp_mult: float = None,
+                           sl_mult: float = None) -> pd.DataFrame:
     """
-    Создаёт ДВА бинарных таргета:
-      Target_BUY:  1 если цена вырастет > TARGET_THRESHOLD за TARGET_HORIZON часов
-      Target_SELL: 1 если цена упадёт  > TARGET_THRESHOLD за TARGET_HORIZON часов
+    Triple Barrier Method по Лопесу де Прадо.
+
+    Для каждой свечи i смотрим вперёд на horizon свечей:
+      - Если цена достигла TP (entry + atr*tp_mult) раньше SL → target_buy = 1
+      - Если цена достигла SL (entry - atr*sl_mult) раньше TP → target_buy = 0
+      - Если ни то ни другое за horizon → метка = NaN (исключаем из обучения)
+
+    Аналогично для SELL (инвертированные барьеры).
+
+    Это ключевое отличие от простого "цена через N часов":
+    простой метод помечает как WIN даже если по пути цена сначала
+    выбила стоп (что в реальной торговле = убыток).
     """
-    future   = df['Close'].shift(-TARGET_HORIZON)
-    pct_chng = (future - df['Close']) / (df['Close'] + 1e-9)
+    if horizon is None:
+        horizon = TARGET_HORIZON
+    if tp_mult is None:
+        tp_mult = ATR_TP_MULT
+    if sl_mult is None:
+        sl_mult = ATR_SL_MULT
+
+    close  = df['Close'].values
+    atr    = df['ATR'].values
+    high   = df['High'].values
+    low    = df['Low'].values
+    n      = len(df)
+
+    target_buy  = np.full(n, np.nan)
+    target_sell = np.full(n, np.nan)
+
+    for i in range(n - horizon):
+        entry  = close[i]
+        atr_i  = atr[i]
+
+        tp_buy = entry + atr_i * tp_mult
+        sl_buy = entry - atr_i * sl_mult
+
+        tp_sell = entry - atr_i * tp_mult
+        sl_sell = entry + atr_i * sl_mult
+
+        buy_result  = np.nan
+        sell_result = np.nan
+
+        for j in range(i + 1, min(i + horizon + 1, n)):
+            h = high[j]
+            l = low[j]
+
+            # BUY барьеры
+            if np.isnan(buy_result):
+                if h >= tp_buy and l <= sl_buy:
+                    # обе зоны в одной свече — смотрим на открытие
+                    buy_result = 1 if close[j-1] < entry + atr_i * 0.5 else 0
+                elif h >= tp_buy:
+                    buy_result = 1
+                elif l <= sl_buy:
+                    buy_result = 0
+
+            # SELL барьеры
+            if np.isnan(sell_result):
+                if l <= tp_sell and h >= sl_sell:
+                    sell_result = 1 if close[j-1] > entry - atr_i * 0.5 else 0
+                elif l <= tp_sell:
+                    sell_result = 1
+                elif h >= sl_sell:
+                    sell_result = 0
+
+            if not np.isnan(buy_result) and not np.isnan(sell_result):
+                break
+
+        target_buy[i]  = buy_result
+        target_sell[i] = sell_result
 
     df = df.copy()
-    df['Target_BUY']  = (pct_chng >  TARGET_THRESHOLD).astype(int)
-    df['Target_SELL'] = (pct_chng < -TARGET_THRESHOLD).astype(int)
-    df = df.iloc[:-TARGET_HORIZON]
+    df['Target_BUY']  = target_buy
+    df['Target_SELL'] = target_sell
 
-    buy_count  = df['Target_BUY'].sum()
-    sell_count = df['Target_SELL'].sum()
-    total      = len(df)
+    total     = n - horizon
+    buy_valid = int(np.sum(~np.isnan(target_buy[:total])))
+    buy_pos   = int(np.nansum(target_buy[:total]))
+    sel_valid = int(np.sum(~np.isnan(target_sell[:total])))
+    sel_pos   = int(np.nansum(target_sell[:total]))
+
     logger.info(
-        f"[Trainer] Разметка: BUY={buy_count} ({buy_count/total:.1%}) "
-        f"SELL={sell_count} ({sell_count/total:.1%}) "
-        f"NEUTRAL={total-buy_count-sell_count} ({(total-buy_count-sell_count)/total:.1%})"
+        f"[Trainer] Triple Barrier: "
+        f"BUY valid={buy_valid} pos={buy_pos} ({buy_pos/(buy_valid+1e-9):.1%}) | "
+        f"SELL valid={sel_valid} pos={sel_pos} ({sel_pos/(sel_valid+1e-9):.1%})"
     )
     return df
 
@@ -307,14 +382,13 @@ def make_targets(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 def apply_smote(X_train: np.ndarray, y_train: np.ndarray) -> tuple:
     if not SMOTE_AVAILABLE:
-        logger.warning("[Trainer] SMOTE недоступен — используем class_weight='balanced'")
         return X_train, y_train
 
     pos = y_train.sum()
     neg = len(y_train) - pos
-    ratio = pos / neg if neg > 0 else 1.0
+    ratio = pos / (neg + 1e-9)
 
-    if ratio > 0.4:  # уже достаточно сбалансировано
+    if ratio > 0.4:
         return X_train, y_train
 
     try:
@@ -322,11 +396,11 @@ def apply_smote(X_train: np.ndarray, y_train: np.ndarray) -> tuple:
         X_res, y_res = smote.fit_resample(X_train, y_train)
         logger.info(
             f"[Trainer] SMOTE: {len(y_train)} → {len(y_res)} "
-            f"(pos: {y_train.sum()} → {y_res.sum()})"
+            f"(pos: {int(y_train.sum())} → {int(y_res.sum())})"
         )
         return X_res, y_res
     except Exception as e:
-        logger.warning(f"[Trainer] SMOTE ошибка: {e} — без балансировки")
+        logger.warning(f"[Trainer] SMOTE ошибка: {e}")
         return X_train, y_train
 
 
@@ -348,14 +422,10 @@ def tune_xgboost(X_train, y_train, X_val, y_val, n_trials: int = 30) -> dict:
             'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 5.0),
         }
         m = XGBClassifier(
-            **params,
-            eval_metric='logloss',
-            use_label_encoder=False,
-            verbosity=0,
+            **params, eval_metric='logloss',
+            use_label_encoder=False, verbosity=0,
         )
-        m.fit(X_train, y_train,
-              eval_set=[(X_val, y_val)],
-              verbose=False)
+        m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
         y_pred = m.predict(X_val)
         return precision_score(y_val, y_pred, zero_division=0)
 
@@ -366,7 +436,7 @@ def tune_xgboost(X_train, y_train, X_val, y_val, n_trials: int = 30) -> dict:
 
 
 # ─────────────────────────────────────────────
-# Обучение одного бинарного XGBoost
+# Обучение XGBoost
 # ─────────────────────────────────────────────
 def train_binary_xgb(X_train, y_train, X_test, y_test,
                      best_params: dict = None) -> tuple:
@@ -379,14 +449,10 @@ def train_binary_xgb(X_train, y_train, X_test, y_test,
         }
 
     model = XGBClassifier(
-        **best_params,
-        eval_metric='logloss',
-        use_label_encoder=False,
-        verbosity=0,
+        **best_params, eval_metric='logloss',
+        use_label_encoder=False, verbosity=0,
     )
-    model.fit(X_train, y_train,
-              eval_set=[(X_test, y_test)],
-              verbose=False)
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
     y_pred  = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
@@ -401,7 +467,7 @@ def train_binary_xgb(X_train, y_train, X_test, y_test,
 
 
 # ─────────────────────────────────────────────
-# Обучение одного бинарного LightGBM
+# Обучение LightGBM
 # ─────────────────────────────────────────────
 def train_binary_lgbm(X_train, y_train, X_test, y_test) -> tuple:
     if not LGBM_AVAILABLE:
@@ -412,18 +478,11 @@ def train_binary_lgbm(X_train, y_train, X_test, y_test) -> tuple:
     scale_pos = neg_count / (pos_count + 1e-9)
 
     model = lgb.LGBMClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.03,
-        subsample=0.75,
-        colsample_bytree=0.70,
-        min_child_samples=20,
-        reg_alpha=0.3,
-        reg_lambda=2.0,
+        n_estimators=300, max_depth=4, learning_rate=0.03,
+        subsample=0.75, colsample_bytree=0.70, min_child_samples=20,
+        reg_alpha=0.3, reg_lambda=2.0,
         scale_pos_weight=min(scale_pos, 5.0),
-        objective='binary',
-        verbosity=-1,
-        n_jobs=-1,
+        objective='binary', verbosity=-1, n_jobs=-1,
     )
     model.fit(
         X_train, y_train,
@@ -445,7 +504,74 @@ def train_binary_lgbm(X_train, y_train, X_test, y_test) -> tuple:
 
 
 # ─────────────────────────────────────────────
-# Walk-Forward для бинарной модели
+# META-LABELING (фильтрующая модель)
+# ─────────────────────────────────────────────
+def train_meta_model(X_train: np.ndarray, y_side_train: np.ndarray,
+                     y_true_train: np.ndarray,
+                     X_test: np.ndarray, y_side_test: np.ndarray,
+                     y_true_test: np.ndarray,
+                     side_model) -> tuple:
+    """
+    Meta-labeling: обучаем вторую модель которая решает
+    'стоит ли входить по сигналу первой модели?'
+
+    Вход для мета-модели = оригинальные фичи + вероятность от side_model
+    Таргет = 1 если side_model был прав (и сделка выиграла)
+           = 0 если side_model ошибся
+
+    Это позволяет бету быть более избирательным:
+    торговать только когда оба уровня согласны.
+    """
+    # Получаем вероятности от side_model
+    p_train = side_model.predict_proba(X_train)[:, 1].reshape(-1, 1)
+    p_test  = side_model.predict_proba(X_test)[:, 1].reshape(-1, 1)
+
+    # Добавляем вероятность как дополнительную фичу
+    X_meta_train = np.hstack([X_train, p_train])
+    X_meta_test  = np.hstack([X_test,  p_test])
+
+    # Таргет мета-модели: правильно ли предсказала side_model?
+    side_pred_train = (p_train.flatten() >= 0.5).astype(int)
+    side_pred_test  = (p_test.flatten()  >= 0.5).astype(int)
+
+    y_meta_train = ((side_pred_train == 1) & (y_true_train == 1)).astype(int)
+    y_meta_test  = ((side_pred_test  == 1) & (y_true_test  == 1)).astype(int)
+
+    if y_meta_train.sum() < 10:
+        logger.warning("[Trainer] Meta-model: мало позитивных примеров, пропускаем")
+        return None, None
+
+    X_meta_sm, y_meta_sm = apply_smote(X_meta_train, y_meta_train)
+
+    meta_model = XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.05,
+        subsample=0.75, colsample_bytree=0.7,
+        min_child_weight=10, gamma=0.3,
+        eval_metric='logloss', use_label_encoder=False, verbosity=0,
+    )
+    meta_model.fit(
+        X_meta_sm, y_meta_sm,
+        eval_set=[(X_meta_test, y_meta_test)],
+        verbose=False,
+    )
+
+    y_pred  = meta_model.predict(X_meta_test)
+    y_proba = meta_model.predict_proba(X_meta_test)[:, 1]
+
+    metrics = {
+        'precision': float(precision_score(y_meta_test, y_pred, zero_division=0)),
+        'recall':    float(recall_score(y_meta_test, y_pred, zero_division=0)),
+        'roc_auc':   float(roc_auc_score(y_meta_test, y_proba)) if y_meta_test.sum() > 0 else 0.0,
+    }
+    logger.info(
+        f"[Trainer] Meta-model: prec={metrics['precision']:.1%} "
+        f"rec={metrics['recall']:.1%} auc={metrics['roc_auc']:.3f}"
+    )
+    return meta_model, metrics
+
+
+# ─────────────────────────────────────────────
+# Walk-Forward с правильным Sharpe
 # ─────────────────────────────────────────────
 def walk_forward_binary(X: np.ndarray, y: np.ndarray,
                         train_size: int, test_size: int, step: int) -> dict:
@@ -459,7 +585,7 @@ def walk_forward_binary(X: np.ndarray, y: np.ndarray,
         X_te = X[start: start + test_size]
         y_te = y[start: start + test_size]
 
-        if y_tr.sum() < 5:
+        if y_tr.sum() < 5 or y_te.sum() < 3:
             start += step
             continue
 
@@ -479,20 +605,37 @@ def walk_forward_binary(X: np.ndarray, y: np.ndarray,
         )
         m.fit(X_tr_sm, y_tr_sm, verbose=False)
 
-        if y_te.sum() > 0:
-            y_pred = m.predict(X_te)
-            prec   = precision_score(y_te, y_pred, zero_division=0)
-            rec    = recall_score(y_te, y_pred, zero_division=0)
-            results.append({'precision': prec, 'recall': rec})
+        y_pred   = m.predict(X_te)
+        y_proba  = m.predict_proba(X_te)[:, 1]
+        prec     = precision_score(y_te, y_pred, zero_division=0)
+        rec      = recall_score(y_te, y_pred, zero_division=0)
 
+        # Правильный Sharpe: симулируем почасовые доходности
+        # +TP_pct если предсказали 1 и было 1 (win)
+        # -SL_pct если предсказали 1 и было 0 (loss)
+        # 0 если предсказали 0 (не входим)
+        tp_pct = ATR_TP_MULT * 0.015  # примерный % от ATR
+        sl_pct = ATR_SL_MULT * 0.015
+        hourly_returns = []
+        for pred, true in zip(y_pred, y_te):
+            if pred == 1:
+                hourly_returns.append(tp_pct if true == 1 else -sl_pct)
+            else:
+                hourly_returns.append(0.0)
+
+        r = np.array(hourly_returns)
+        sharpe = float(r.mean() / (r.std() + 1e-9) * np.sqrt(8760)) if r.std() > 0 else 0.0
+
+        results.append({'precision': prec, 'recall': rec, 'sharpe': sharpe})
         start += step
 
     if not results:
-        return {'wf_precision': 0.0, 'wf_recall': 0.0, 'wf_folds': 0}
+        return {'wf_precision': 0.0, 'wf_recall': 0.0, 'wf_sharpe': 0.0, 'wf_folds': 0}
 
     return {
-        'wf_precision': round(np.mean([r['precision'] for r in results]), 4),
-        'wf_recall':    round(np.mean([r['recall']    for r in results]), 4),
+        'wf_precision': round(float(np.mean([r['precision'] for r in results])), 4),
+        'wf_recall':    round(float(np.mean([r['recall']    for r in results])), 4),
+        'wf_sharpe':    round(float(np.mean([r['sharpe']    for r in results])), 3),
         'wf_folds':     len(results),
     }
 
@@ -509,10 +652,10 @@ def get_available_features(df: pd.DataFrame, desired: list) -> list:
 
 
 # ─────────────────────────────────────────────
-# ГЛАВНАЯ: обучение двух бинарных ансамблей
+# ГЛАВНАЯ: обучение с Triple Barrier + Meta-Label
 # ─────────────────────────────────────────────
 def train_model() -> dict:
-    logger.info("[Trainer] 🚀 v5.0: Двойные бинарные классификаторы + SMOTE + Optuna")
+    logger.info("[Trainer] 🚀 v6.0: Triple Barrier + Meta-Labeling + Правильный Sharpe")
 
     # 1. Данные
     df1h_raw = fetch_ohlcv("TON-USDT", "1H", 3000)
@@ -536,10 +679,15 @@ def train_model() -> dict:
     if len(df) < 300:
         return {"success": False, "error": f"Мало данных: {len(df)}"}
 
-    # 3. Бинарные таргеты
-    df = make_targets(df)
+    # 3. TRIPLE BARRIER разметка
+    logger.info("[Trainer] 🎯 Triple Barrier разметка...")
+    df = triple_barrier_labels(df)
 
-    # 4. Фичи
+    # 4. Убираем строки без метки (горизонт не достигнут)
+    df_buy  = df[~df['Target_BUY'].isna()].copy()
+    df_sell = df[~df['Target_SELL'].isna()].copy()
+
+    # 5. Фичи
     feature_cols = get_available_features(df, FEATURE_COLS)
     if len(feature_cols) < 10:
         feature_cols = get_available_features(df, FEATURE_COLS_LEGACY)
@@ -547,116 +695,126 @@ def train_model() -> dict:
     else:
         logger.info(f"[Trainer] Используем {len(feature_cols)} признаков")
 
-    X = df[feature_cols].values.astype(np.float32)
-    y_buy  = df['Target_BUY'].values
-    y_sell = df['Target_SELL'].values
+    X_buy  = df_buy[feature_cols].values.astype(np.float32)
+    y_buy  = df_buy['Target_BUY'].values.astype(int)
+    X_sell = df_sell[feature_cols].values.astype(np.float32)
+    y_sell = df_sell['Target_SELL'].values.astype(int)
 
-    # 5. Train/test split (временной ряд!)
-    split = int(len(X) * 0.8)
-    X_train, X_test = X[:split], X[split:]
-    y_buy_train,  y_buy_test  = y_buy[:split],  y_buy[split:]
-    y_sell_train, y_sell_test = y_sell[:split], y_sell[split:]
+    # 6. Train/test split
+    split_buy  = int(len(X_buy)  * 0.8)
+    split_sell = int(len(X_sell) * 0.8)
+
+    X_buy_train,  X_buy_test  = X_buy[:split_buy],   X_buy[split_buy:]
+    y_buy_train,  y_buy_test  = y_buy[:split_buy],   y_buy[split_buy:]
+    X_sell_train, X_sell_test = X_sell[:split_sell], X_sell[split_sell:]
+    y_sell_train, y_sell_test = y_sell[:split_sell], y_sell[split_sell:]
 
     logger.info(
-        f"[Trainer] Train: {len(X_train)} | Test: {len(X_test)} | "
-        f"BUY pos train: {y_buy_train.sum()} | SELL pos train: {y_sell_train.sum()}"
+        f"[Trainer] BUY train={len(X_buy_train)} pos={y_buy_train.sum()} | "
+        f"SELL train={len(X_sell_train)} pos={y_sell_train.sum()}"
     )
 
-    # 6. SMOTE
-    logger.info("[Trainer] 🔄 SMOTE балансировка BUY...")
-    X_buy_sm, y_buy_sm   = apply_smote(X_train, y_buy_train)
-    logger.info("[Trainer] 🔄 SMOTE балансировка SELL...")
-    X_sell_sm, y_sell_sm = apply_smote(X_train, y_sell_train)
+    # 7. SMOTE
+    logger.info("[Trainer] 🔄 SMOTE BUY...")
+    X_buy_sm,  y_buy_sm  = apply_smote(X_buy_train,  y_buy_train)
+    logger.info("[Trainer] 🔄 SMOTE SELL...")
+    X_sell_sm, y_sell_sm = apply_smote(X_sell_train, y_sell_train)
 
-    # 7. Optuna тюнинг для BUY-модели (30 trials)
-    logger.info("[Trainer] 🔬 Optuna тюнинг BUY-модели (30 trials)...")
-    val_split    = int(len(X_buy_sm) * 0.85)
-    X_opt_tr     = X_buy_sm[:val_split]
-    y_opt_tr     = y_buy_sm[:val_split]
-    X_opt_val    = X_buy_sm[val_split:]
-    y_opt_val    = y_buy_sm[val_split:]
-    best_params  = tune_xgboost(X_opt_tr, y_opt_tr, X_opt_val, y_opt_val, n_trials=30)
-    logger.info(f"[Trainer] Best params: {best_params}")
+    # 8. Optuna
+    logger.info("[Trainer] 🔬 Optuna тюнинг BUY (30 trials)...")
+    val_split   = int(len(X_buy_sm) * 0.85)
+    best_params = tune_xgboost(
+        X_buy_sm[:val_split], y_buy_sm[:val_split],
+        X_buy_sm[val_split:], y_buy_sm[val_split:],
+        n_trials=30
+    )
 
-    # 8. Обучение BUY-моделей
+    # 9. BUY модели
     logger.info("[Trainer] 🔧 XGBoost BUY...")
-    buy_xgb, buy_xgb_m = train_binary_xgb(X_buy_sm, y_buy_sm, X_test, y_buy_test, best_params)
-    logger.info(
-        f"[Trainer] BUY XGB: prec={buy_xgb_m['precision']:.1%} "
-        f"rec={buy_xgb_m['recall']:.1%} "
-        f"auc={buy_xgb_m['roc_auc']:.3f}"
-    )
+    buy_xgb, buy_xgb_m = train_binary_xgb(X_buy_sm, y_buy_sm, X_buy_test, y_buy_test, best_params)
+    logger.info(f"[Trainer] BUY XGB: prec={buy_xgb_m['precision']:.1%} auc={buy_xgb_m['roc_auc']:.3f}")
 
     logger.info("[Trainer] 🔧 LightGBM BUY...")
-    buy_lgbm, buy_lgbm_m = train_binary_lgbm(X_buy_sm, y_buy_sm, X_test, y_buy_test)
+    buy_lgbm, buy_lgbm_m = train_binary_lgbm(X_buy_sm, y_buy_sm, X_buy_test, y_buy_test)
     if buy_lgbm_m:
-        logger.info(
-            f"[Trainer] BUY LGBM: prec={buy_lgbm_m['precision']:.1%} "
-            f"rec={buy_lgbm_m['recall']:.1%} "
-            f"auc={buy_lgbm_m['roc_auc']:.3f}"
-        )
+        logger.info(f"[Trainer] BUY LGBM: prec={buy_lgbm_m['precision']:.1%} auc={buy_lgbm_m['roc_auc']:.3f}")
 
-    # 9. Обучение SELL-моделей
+    # 10. SELL модели
     logger.info("[Trainer] 🔧 XGBoost SELL...")
-    sell_xgb, sell_xgb_m = train_binary_xgb(X_sell_sm, y_sell_sm, X_test, y_sell_test, best_params)
-    logger.info(
-        f"[Trainer] SELL XGB: prec={sell_xgb_m['precision']:.1%} "
-        f"rec={sell_xgb_m['recall']:.1%} "
-        f"auc={sell_xgb_m['roc_auc']:.3f}"
-    )
+    sell_xgb, sell_xgb_m = train_binary_xgb(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test, best_params)
+    logger.info(f"[Trainer] SELL XGB: prec={sell_xgb_m['precision']:.1%} auc={sell_xgb_m['roc_auc']:.3f}")
 
     logger.info("[Trainer] 🔧 LightGBM SELL...")
-    sell_lgbm, sell_lgbm_m = train_binary_lgbm(X_sell_sm, y_sell_sm, X_test, y_sell_test)
+    sell_lgbm, sell_lgbm_m = train_binary_lgbm(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test)
     if sell_lgbm_m:
-        logger.info(
-            f"[Trainer] SELL LGBM: prec={sell_lgbm_m['precision']:.1%} "
-            f"rec={sell_lgbm_m['recall']:.1%} "
-            f"auc={sell_lgbm_m['roc_auc']:.3f}"
-        )
+        logger.info(f"[Trainer] SELL LGBM: prec={sell_lgbm_m['precision']:.1%} auc={sell_lgbm_m['roc_auc']:.3f}")
 
-    # 10. Walk-Forward
+    # 11. META-LABELING
+    logger.info("[Trainer] 🧩 Meta-model BUY...")
+    meta_buy, meta_buy_m = train_meta_model(
+        X_buy_train, y_buy_train, y_buy_train,
+        X_buy_test,  y_buy_test,  y_buy_test,
+        buy_xgb
+    )
+
+    logger.info("[Trainer] 🧩 Meta-model SELL...")
+    meta_sell, meta_sell_m = train_meta_model(
+        X_sell_train, y_sell_train, y_sell_train,
+        X_sell_test,  y_sell_test,  y_sell_test,
+        sell_xgb
+    )
+
+    # 12. Walk-Forward
     hours_per_day = 24
     wf_train = WF_TRAIN_DAYS * hours_per_day
     wf_test  = WF_TEST_DAYS  * hours_per_day
     wf_step  = WF_STEP_DAYS  * hours_per_day
 
     logger.info("[Trainer] 📊 Walk-Forward BUY...")
-    wf_buy  = walk_forward_binary(X, y_buy,  wf_train, wf_test, wf_step)
+    wf_buy  = walk_forward_binary(X_buy,  y_buy,  wf_train, wf_test, wf_step)
     logger.info("[Trainer] 📊 Walk-Forward SELL...")
-    wf_sell = walk_forward_binary(X, y_sell, wf_train, wf_test, wf_step)
+    wf_sell = walk_forward_binary(X_sell, y_sell, wf_train, wf_test, wf_step)
     logger.info(
         f"[Trainer] WF BUY:  prec={wf_buy['wf_precision']:.1%} "
-        f"rec={wf_buy['wf_recall']:.1%} folds={wf_buy['wf_folds']}"
+        f"sharpe={wf_buy['wf_sharpe']:.2f} folds={wf_buy['wf_folds']}"
     )
     logger.info(
         f"[Trainer] WF SELL: prec={wf_sell['wf_precision']:.1%} "
-        f"rec={wf_sell['wf_recall']:.1%} folds={wf_sell['wf_folds']}"
+        f"sharpe={wf_sell['wf_sharpe']:.2f} folds={wf_sell['wf_folds']}"
     )
 
-    # 11. Сохраняем модели
+    # 13. Сохраняем модели
     joblib.dump(buy_xgb,  MODEL_PATH_BUY_XGB)
     joblib.dump(sell_xgb, MODEL_PATH_SELL_XGB)
     if buy_lgbm:
         joblib.dump(buy_lgbm,  MODEL_PATH_BUY_LGBM)
     if sell_lgbm:
         joblib.dump(sell_lgbm, MODEL_PATH_SELL_LGBM)
+    if meta_buy:
+        joblib.dump(meta_buy,  META_MODEL_BUY_PATH)
+        logger.info(f"[Trainer] ✅ Meta-model BUY сохранена: {META_MODEL_BUY_PATH}")
+    if meta_sell:
+        joblib.dump(meta_sell, META_MODEL_SELL_PATH)
+        logger.info(f"[Trainer] ✅ Meta-model SELL сохранена: {META_MODEL_SELL_PATH}")
 
     with open(MODEL_FEATURES_PATH, 'w') as f:
         json.dump(feature_cols, f)
 
-    # 12. Итоги
+    # 14. Итоги
     avg_buy_prec  = (buy_xgb_m['precision'] + (buy_lgbm_m['precision'] if buy_lgbm_m else buy_xgb_m['precision'])) / 2
     avg_sell_prec = (sell_xgb_m['precision'] + (sell_lgbm_m['precision'] if sell_lgbm_m else sell_xgb_m['precision'])) / 2
     avg_buy_auc   = (buy_xgb_m['roc_auc']   + (buy_lgbm_m['roc_auc']   if buy_lgbm_m else buy_xgb_m['roc_auc']))   / 2
     avg_sell_auc  = (sell_xgb_m['roc_auc']  + (sell_lgbm_m['roc_auc']  if sell_lgbm_m else sell_xgb_m['roc_auc'])) / 2
 
     stats = {
-        "success":       True,
-        "n_features":    len(feature_cols),
-        "n_samples":     len(df),
-        "n_train":       split,
-        "n_test":        len(X_test),
-        # BUY
+        "success":            True,
+        "labeling":           "triple_barrier",
+        "n_features":         len(feature_cols),
+        "n_samples_buy":      len(df_buy),
+        "n_samples_sell":     len(df_sell),
+        "n_samples":          len(df_buy),
+        "n_train":            split_buy,
+        "n_test":             len(X_buy_test),
         "buy_xgb_precision":  buy_xgb_m['precision'],
         "buy_xgb_recall":     buy_xgb_m['recall'],
         "buy_xgb_auc":        buy_xgb_m['roc_auc'],
@@ -664,7 +822,6 @@ def train_model() -> dict:
         "buy_lgbm_auc":       buy_lgbm_m['roc_auc']  if buy_lgbm_m else None,
         "avg_buy_precision":  avg_buy_prec,
         "avg_buy_auc":        avg_buy_auc,
-        # SELL
         "sell_xgb_precision":  sell_xgb_m['precision'],
         "sell_xgb_recall":     sell_xgb_m['recall'],
         "sell_xgb_auc":        sell_xgb_m['roc_auc'],
@@ -672,31 +829,31 @@ def train_model() -> dict:
         "sell_lgbm_auc":       sell_lgbm_m['roc_auc']  if sell_lgbm_m else None,
         "avg_sell_precision":  avg_sell_prec,
         "avg_sell_auc":        avg_sell_auc,
-        # Walk-Forward
-        "wf_buy_precision":   wf_buy['wf_precision'],
-        "wf_buy_recall":      wf_buy['wf_recall'],
-        "wf_sell_precision":  wf_sell['wf_precision'],
-        "wf_sell_recall":     wf_sell['wf_recall'],
-        "wf_folds":           wf_buy['wf_folds'],
-        # Совместимость
-        "xgb_precision":      avg_buy_prec,
-        "lgbm_precision":     buy_lgbm_m['precision'] if buy_lgbm_m else None,
-        "ensemble_precision": (avg_buy_prec + avg_sell_prec) / 2,
-        "wf_precision":       (wf_buy['wf_precision'] + wf_sell['wf_precision']) / 2,
-        "wf_accuracy":        0.0,
-        "lgbm_available":     LGBM_AVAILABLE,
-        "smote_available":    SMOTE_AVAILABLE,
-        "best_params":        best_params,
+        "meta_buy_precision":  meta_buy_m['precision'] if meta_buy_m else None,
+        "meta_sell_precision": meta_sell_m['precision'] if meta_sell_m else None,
+        "wf_buy_precision":    wf_buy['wf_precision'],
+        "wf_sell_precision":   wf_sell['wf_precision'],
+        "wf_buy_sharpe":       wf_buy['wf_sharpe'],
+        "wf_sell_sharpe":      wf_sell['wf_sharpe'],
+        "wf_folds":            wf_buy['wf_folds'],
+        "xgb_precision":       avg_buy_prec,
+        "lgbm_precision":      buy_lgbm_m['precision'] if buy_lgbm_m else None,
+        "ensemble_precision":  (avg_buy_prec + avg_sell_prec) / 2,
+        "wf_precision":        (wf_buy['wf_precision'] + wf_sell['wf_precision']) / 2,
+        "wf_accuracy":         0.0,
+        "lgbm_available":      LGBM_AVAILABLE,
+        "smote_available":     SMOTE_AVAILABLE,
+        "meta_labeling":       meta_buy is not None,
     }
 
     with open(STATS_FILE, 'w') as f:
-        json.dump({k: v for k, v in stats.items() if k not in ('best_params',)}, f, indent=2)
+        json.dump({k: v for k, v in stats.items()}, f, indent=2)
 
     logger.info(
         f"[Trainer] ✅ Готово! "
         f"BUY prec={avg_buy_prec:.1%} auc={avg_buy_auc:.3f} | "
         f"SELL prec={avg_sell_prec:.1%} auc={avg_sell_auc:.3f} | "
-        f"WF BUY={wf_buy['wf_precision']:.1%} SELL={wf_sell['wf_precision']:.1%}"
+        f"WF Sharpe BUY={wf_buy['wf_sharpe']:.2f} SELL={wf_sell['wf_sharpe']:.2f}"
     )
 
     return {

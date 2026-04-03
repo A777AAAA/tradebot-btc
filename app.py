@@ -1,10 +1,11 @@
 """
-TradeBot v5.0 — Dual Binary Classifier Edition
-v5.0 изменения:
-  - 2 бинарных классификатора: BUY-модель + SELL-модель (SMOTE + Optuna)
-  - Перцентильный фильтр уверенности (топ-35%)
-  - ML-бэктест (Sharpe ratio)
-  - Обновлён Telegram-отчёт
+TradeBot v6.0 — Triple Barrier + Meta-Labeling + LunarCrush
+v6.0 изменения:
+  - Triple Barrier разметка в auto_trainer
+  - Meta-labeling фильтр (вторая фильтрующая модель)
+  - Правильный Sharpe в бэктесте
+  - LunarCrush API сентимент (реальные соцсети)
+  - Calmar Ratio в бэктест-отчёте
 """
 
 import threading
@@ -47,7 +48,7 @@ health_app = Flask(__name__)
 
 @health_app.route("/health")
 def health():
-    return {"status": "ok", "bot": "TradeBot v5.0"}, 200
+    return {"status": "ok", "bot": "TradeBot v6.0"}, 200
 
 @health_app.route("/")
 def index():
@@ -55,7 +56,7 @@ def index():
         stats = get_statistics()
         paper = get_stats()
         return {
-            "bot":           "TradeBot v5.0 — Dual Binary Classifiers",
+            "bot":           "TradeBot v6.0 — Triple Barrier + Meta-Labeling",
             "symbol":        SYMBOL,
             "paper_balance": paper["balance"],
             "paper_winrate": paper["winrate"],
@@ -74,7 +75,7 @@ def run_health_server():
 # ═══════════════════════════════════════════
 def trading_loop():
     global _last_trade_time
-    logger.info(f"🚀 Торговый цикл v5.0 запущен | {SYMBOL}")
+    logger.info(f"🚀 Торговый цикл v6.0 запущен | {SYMBOL}")
 
     while True:
         try:
@@ -127,21 +128,29 @@ def trading_loop():
             models     = signal_data.get("models_used","XGB")
             mtf_ok     = signal_data.get("mtf_confirmed", True)
             btc_ch     = signal_data.get("btc_change_4h", 0.0)
+            rsi        = signal_data.get("rsi14",      50.0)
+            # v6.0: meta-model вероятность (если live_signal поддерживает)
+            p_meta     = signal_data.get("p_meta",     None)
 
             logger.info(
                 f"📊 {signal} | p_buy={p_buy:.1%} p_sell={p_sell:.1%} | "
                 f"ADX={adx:.1f} | 4H={'✅' if mtf_ok else '❌'} | BTC={btc_ch:+.2f}%"
+                + (f" | meta={p_meta:.1%}" if p_meta is not None else "")
             )
 
             # Открытие сделки
             if signal in ("BUY", "SELL") and confidence >= MIN_CONFIDENCE:
                 try:
-                    sent  = get_market_sentiment(price, change_24h, volume)
+                    sent  = get_market_sentiment(price, change_24h, volume,
+                                                  rsi=rsi, symbol="TON")
                     boost = sentiment_to_signal_boost(sent, signal)
+                    old_conf = confidence
                     confidence = min(confidence * boost, 0.99)
                     logger.info(
                         f"🧠 Sentiment: {sent.get('sentiment')} "
-                        f"boost={boost:.2f} → conf={confidence:.1%}"
+                        f"src={sent.get('source','?')} "
+                        f"boost={boost:.2f} "
+                        f"conf: {old_conf:.1%}→{confidence:.1%}"
                     )
                 except Exception:
                     pass
@@ -168,17 +177,31 @@ def trading_loop():
                         _last_trade_time = time.time()
                         emoji = "🟢" if signal == "BUY" else "🔴"
 
+                        meta_line = ""
+                        if p_meta is not None:
+                            meta_line = f"\n🧩 Meta-filter:   <b>{p_meta:.1%}</b>"
+
+                        sent_info = sent if 'sent' in dir() else {}
+                        sent_line = ""
+                        if sent_info:
+                            sent_line = (
+                                f"\n🌐 Sentiment:     <b>{sent_info.get('sentiment','?')} "
+                                f"({sent_info.get('source','?')})</b>"
+                            )
+
                         send_message(
                             f"{emoji} <b>Новая сделка: {signal} {strength_label}</b>\n\n"
                             f"💵 Цена:          <b>${price:.4f}</b>\n"
                             f"🎯 p(BUY):        <b>{p_buy:.1%}</b>\n"
-                            f"🎯 p(SELL):       <b>{p_sell:.1%}</b>\n"
-                            f"📈 24h change:    <b>{change_24h:+.2f}%</b>\n"
+                            f"🎯 p(SELL):       <b>{p_sell:.1%}</b>"
+                            f"{meta_line}"
+                            f"\n📈 24h change:    <b>{change_24h:+.2f}%</b>\n"
                             f"📐 ATR:           <b>{atr:.4f}</b>\n"
                             f"💹 ADX:           <b>{adx:.1f}</b>\n"
                             f"🤖 Модели:        <b>{models}</b>\n"
-                            f"📊 BTC 4H:        <b>{btc_ch:+.2f}%</b>\n"
-                            f"💼 Размер:        <b>${trade['amount_usd']:.2f}</b>\n"
+                            f"📊 BTC 4H:        <b>{btc_ch:+.2f}%</b>"
+                            f"{sent_line}"
+                            f"\n💼 Размер:        <b>${trade['amount_usd']:.2f}</b>\n"
                             f"🛑 SL: <b>${trade['sl']:.4f}</b> | "
                             f"✅ TP: <b>${trade['tp']:.4f}</b>\n"
                             f"🔄 Trailing SL:   <b>{'Активен' if trade.get('trailing_active') else 'Ожидание +1%'}</b>"
@@ -200,7 +223,7 @@ def trading_loop():
 # ═══════════════════════════════════════════
 def retrainer_loop():
     time.sleep(60)
-    logger.info("🧠 Retrainer v5.0 запущен (Dual Binary + SMOTE + Optuna, 24ч)")
+    logger.info("🧠 Retrainer v6.0 запущен (Triple Barrier + Meta-Labeling, 24ч)")
 
     while True:
         try:
@@ -212,21 +235,41 @@ def retrainer_loop():
                 sell_auc  = result.get("avg_sell_auc", 0)
                 wf_buy    = result.get("wf_buy_precision", 0)
                 wf_sell   = result.get("wf_sell_precision", 0)
+                wf_sharpe_buy  = result.get("wf_buy_sharpe", 0)
+                wf_sharpe_sell = result.get("wf_sell_sharpe", 0)
+                meta_buy_p  = result.get("meta_buy_precision")
+                meta_sell_p = result.get("meta_sell_precision")
+                labeling    = result.get("labeling", "simple")
+
+                meta_line = ""
+                if meta_buy_p is not None:
+                    meta_line = (
+                        f"\n\n🧩 Meta-filter:\n"
+                        f"   BUY prec:  <b>{meta_buy_p:.1%}</b>\n"
+                        f"   SELL prec: <b>{meta_sell_p:.1%}</b>"
+                        if meta_sell_p else
+                        f"\n\n🧩 Meta-filter BUY: <b>{meta_buy_p:.1%}</b>"
+                    )
 
                 send_message(
-                    f"🧠 <b>Ансамбль v5.0 переобучен!</b>\n\n"
+                    f"🧠 <b>Ансамбль v6.0 переобучен!</b>\n\n"
+                    f"🏷 Разметка: <b>{'Triple Barrier ✅' if labeling == 'triple_barrier' else 'Simple'}</b>\n\n"
                     f"🟢 BUY-модель:\n"
                     f"   Precision: <b>{buy_prec:.1%}</b>\n"
                     f"   ROC-AUC:   <b>{buy_auc:.3f}</b>\n"
-                    f"   WF prec:   <b>{wf_buy:.1%}</b>\n\n"
+                    f"   WF prec:   <b>{wf_buy:.1%}</b>\n"
+                    f"   WF Sharpe: <b>{wf_sharpe_buy:.2f}</b>\n\n"
                     f"🔴 SELL-модель:\n"
                     f"   Precision: <b>{sell_prec:.1%}</b>\n"
                     f"   ROC-AUC:   <b>{sell_auc:.3f}</b>\n"
-                    f"   WF prec:   <b>{wf_sell:.1%}</b>\n\n"
-                    f"📚 Выборка:  <b>{result['n_samples']}</b> свечей\n"
-                    f"🔢 Признаков: <b>{result.get('n_features','?')}</b>\n"
-                    f"⚗️ SMOTE:    <b>{'✅' if result.get('smote_available') else '❌'}</b>\n"
-                    f"🔬 Optuna:   <b>30 trials ✅</b>"
+                    f"   WF prec:   <b>{wf_sell:.1%}</b>\n"
+                    f"   WF Sharpe: <b>{wf_sharpe_sell:.2f}</b>"
+                    f"{meta_line}\n\n"
+                    f"📚 BUY выборка: <b>{result.get('n_samples_buy','?')}</b>\n"
+                    f"📚 SELL выборка:<b>{result.get('n_samples_sell','?')}</b>\n"
+                    f"🔢 Признаков:  <b>{result.get('n_features','?')}</b>\n"
+                    f"⚗️ SMOTE:      <b>{'✅' if result.get('smote_available') else '❌'}</b>\n"
+                    f"🔬 Optuna:     <b>30 trials ✅</b>"
                 )
             else:
                 logger.warning(f"[Retrainer] Неудача: {result.get('error')}")
@@ -278,7 +321,7 @@ if __name__ == "__main__":
         logger.critical(f"❌ Не заданы переменные окружения: {errors}")
         exit(1)
 
-    logger.info("✅ Конфиг OK, запускаем TradeBot v5.0...")
+    logger.info("✅ Конфиг OK, запускаем TradeBot v6.0...")
 
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=retrainer_loop,    daemon=True).start()
@@ -286,14 +329,18 @@ if __name__ == "__main__":
     threading.Thread(target=backtest_loop,     daemon=True).start()
     threading.Thread(target=stats_loop,        daemon=True).start()
 
+    lunarcrush_status = "✅ Активен" if os.getenv("LUNARCRUSH_API_KEY") else "⚠️ Нет ключа (технический fallback)"
+
     send_message(
-        "🤖 <b>TradeBot v5.0 запущен!</b>\n\n"
+        "🤖 <b>TradeBot v6.0 запущен!</b>\n\n"
         f"📊 Пара:              <b>{SYMBOL}</b>\n"
         f"⏱ Интервал:          <b>{SIGNAL_INTERVAL_MINUTES} мин</b>\n"
         f"🎯 Мин. уверенность: <b>{MIN_CONFIDENCE:.0%}</b>\n\n"
-        f"🔬 <b>Архитектура v5.0:</b>\n"
+        f"🔬 <b>Архитектура v6.0:</b>\n"
         f"   🟢 BUY-модель:    XGB + LGBM (бинарный)\n"
         f"   🔴 SELL-модель:   XGB + LGBM (бинарный)\n"
+        f"   🏷 Разметка:      Triple Barrier Method\n"
+        f"   🧩 Meta-filter:   фильтрующая модель\n"
         f"   ⚗️ SMOTE:         балансировка 1:1\n"
         f"   🔬 Optuna:        30 trials гиперпараметров\n"
         f"   📊 Перцентиль:    топ-35% сигналов\n"
@@ -301,6 +348,8 @@ if __name__ == "__main__":
         f"   ₿  BTC macro:     активен (-4% блок)\n"
         f"   💹 ADX фильтр:    > {18} (нет сделок в боковике)\n"
         f"   🔄 Trailing SL:   +1.0% breakeven / +1.5% trail\n"
+        f"   🌐 Sentiment:     LunarCrush — {lunarcrush_status}\n"
+        f"   📐 Sharpe:        почасовой (правильный)\n"
         f"   🔢 Признаков:     44"
     )
 

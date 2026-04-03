@@ -1,11 +1,12 @@
 """
-live_signal.py v5.0 — Двойные бинарные классификаторы
+live_signal.py v6.0 — Двойные бинарные классификаторы + Meta-Labeling
 АРХИТЕКТУРА:
-  - BUY-модель:  p_buy  = avg(XGB_buy_proba,  LGBM_buy_proba)
-  - SELL-модель: p_sell = avg(XGB_sell_proba, LGBM_sell_proba)
-  - Сигнал: если p_buy > MIN_CONFIDENCE → BUY, p_sell > MIN_CONFIDENCE → SELL
-  - Динамический порог: торгуем только топ-35% сигналов по уверенности
-  - Все прежние фильтры: ADX, 4H MTF, BTC macro
+  Layer 1 — BUY-модель:  XGB_buy + LGBM_buy  -> p_buy  = avg(...)
+  Layer 1 — SELL-модель: XGB_sell + LGBM_sell -> p_sell = avg(...)
+  Layer 2 — Meta-filter: meta_model_buy.pkl   -> доп. фильтр для BUY
+  Layer 2 — Meta-filter: meta_model_sell.pkl  -> доп. фильтр для SELL
+  Layer 3 — Фильтры: ADX режим + 4H MTF + BTC macro + Funding Rate
+  Layer 4 — Market Regime: адаптивный порог под тренд/боковик/волатильность
 """
 
 import ccxt
@@ -13,8 +14,10 @@ import json
 import joblib
 import logging
 import os
+import time
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 from config import (
     MODEL_PATH_BUY_XGB, MODEL_PATH_BUY_LGBM,
@@ -22,17 +25,30 @@ from config import (
     MODEL_FEATURES_PATH, FEATURE_COLS, FEATURE_COLS_LEGACY,
     MIN_CONFIDENCE, CONFIDENCE_PERCENTILE,
     MTF_ENABLED, BTC_FILTER_ENABLED, BTC_CORRELATION_THRESH,
-    REGIME_FILTER_ENABLED, REGIME_ADX_THRESHOLD
+    REGIME_FILTER_ENABLED, REGIME_ADX_THRESHOLD,
+    SYMBOL
 )
 
 logger = logging.getLogger(__name__)
 
 OKX_CONFIG = {'options': {'defaultType': 'spot'}, 'timeout': 30000}
 
-# Скользящий буфер уверенности для перцентильного фильтра
-_confidence_history = []
-_HISTORY_MAX = 48   # 48 часов
+# Пути к мета-моделям (создаются auto_trainer.py автоматически)
+META_MODEL_BUY_PATH  = "meta_model_buy.pkl"
+META_MODEL_SELL_PATH = "meta_model_sell.pkl"
 
+# Скользящий буфер уверенности для перцентильного фильтра
+_confidence_history: list = []
+_HISTORY_MAX = 48  # 48 часов истории
+
+# Кэш funding rate — не долбим API каждую минуту
+_funding_cache: dict = {"rate": 0.0, "oi_change": 0.0, "bias": "neutral", "ts": 0.0}
+_FUNDING_TTL = 300  # секунд (5 минут)
+
+
+# ===============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ===============================================================
 
 def _get_exchange():
     return ccxt.okx(OKX_CONFIG)
@@ -55,6 +71,93 @@ def load_feature_cols() -> list:
     return FEATURE_COLS
 
 
+# ===============================================================
+# ORDER FLOW — Funding Rate + Open Interest
+# Институциональные боты используют это как доп. фильтр.
+# OKX отдаёт бесплатно через perpetual API.
+# Если TON нет на фьючерсах — тихо возвращает нейтраль.
+# ===============================================================
+
+def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
+    """
+    Получает Funding Rate и изменение Open Interest.
+    Логика интерпретации:
+      funding > +0.01%  = много лонгов (перегрет вверх) -> осторожно с BUY
+      funding < -0.01%  = много шортов (перегрет вниз)  -> осторожно с SELL
+      OI растёт + цена  = сильный тренд (хорошо для BUY)
+      OI падает + цена  = слабый тренд, возможный разворот
+    """
+    global _funding_cache
+
+    now = time.time()
+    if now - _funding_cache["ts"] < _FUNDING_TTL:
+        return {
+            "funding_rate":  _funding_cache["rate"],
+            "oi_change_pct": _funding_cache["oi_change"],
+            "funding_bias":  _funding_cache["bias"],
+        }
+
+    result = {"funding_rate": 0.0, "oi_change_pct": 0.0, "funding_bias": "neutral"}
+
+    try:
+        swap_exchange = ccxt.okx({'options': {'defaultType': 'swap'}, 'timeout': 30000})
+        swap_symbol   = symbol_spot + ":USDT"
+
+        # Funding Rate
+        fr_data      = swap_exchange.fetch_funding_rate(swap_symbol)
+        funding_rate = float(fr_data.get("fundingRate", 0.0))
+
+        # Open Interest delta
+        oi_change_pct = 0.0
+        try:
+            oi_hist = swap_exchange.fetch_open_interest_history(
+                swap_symbol, timeframe='1h', limit=3
+            )
+            if oi_hist and len(oi_hist) >= 2:
+                oi_now  = float(oi_hist[-1].get("openInterestAmount", 1))
+                oi_prev = float(oi_hist[-2].get("openInterestAmount", 1))
+                if oi_prev > 0:
+                    oi_change_pct = (oi_now - oi_prev) / oi_prev * 100
+        except Exception:
+            pass
+
+        # Bias
+        if funding_rate > 0.0001:
+            bias = "long_crowded"
+        elif funding_rate < -0.0001:
+            bias = "short_crowded"
+        else:
+            bias = "neutral"
+
+        result = {
+            "funding_rate":  funding_rate,
+            "oi_change_pct": oi_change_pct,
+            "funding_bias":  bias,
+        }
+
+        _funding_cache.update({
+            "rate":      funding_rate,
+            "oi_change": oi_change_pct,
+            "bias":      bias,
+            "ts":        now,
+        })
+
+        logger.debug(
+            f"[OrderFlow] funding={funding_rate:.4%} "
+            f"OI_delta={oi_change_pct:+.2f}% bias={bias}"
+        )
+
+    except Exception as e:
+        logger.debug(f"[OrderFlow] Недоступно (нормально для spot): {e}")
+        _funding_cache["ts"] = now  # не стучимся ещё 5 минут
+
+    return result
+
+
+# ===============================================================
+# ИНДИКАТОРЫ 1H
+# ===============================================================
+
 def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d     = df.copy()
     close = d['Close']
@@ -65,6 +168,7 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['Hour']      = d.index.hour
     d['DayOfWeek'] = d.index.dayofweek
 
+    # RSI 7, 14, 21
     for p in [7, 14, 21]:
         diff  = close.diff()
         g     = diff.clip(lower=0)
@@ -73,13 +177,15 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
         avg_l = l.ewm(com=p - 1, min_periods=p).mean()
         d[f'RSI_{p}'] = 100 - (100 / (1 + avg_g / (avg_l + 1e-9)))
 
+    # MACD
     ema12            = close.ewm(span=12, adjust=False).mean()
     ema26            = close.ewm(span=26, adjust=False).mean()
     d['MACD']        = ema12 - ema26
     d['MACD_signal'] = d['MACD'].ewm(span=9, adjust=False).mean()
     d['MACD_hist']   = d['MACD'] - d['MACD_signal']
 
-    tr  = pd.concat([
+    # ATR
+    tr    = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low  - close.shift()).abs()
@@ -91,33 +197,39 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['ATR_norm'] = atr14 / (close + 1e-9)
     d['ATR_ratio']= atr14 / (atr50 + 1e-9)
 
-    sma20        = close.rolling(20).mean()
-    std20        = close.rolling(20).std()
-    bb_upper     = sma20 + 2 * std20
-    bb_lower     = sma20 - 2 * std20
-    d['BB_pos']  = (close - bb_lower) / (4 * std20 + 1e-9)
+    # Bollinger Bands
+    sma20         = close.rolling(20).mean()
+    std20         = close.rolling(20).std()
+    bb_upper      = sma20 + 2 * std20
+    bb_lower      = sma20 - 2 * std20
+    d['BB_pos']   = (close - bb_lower) / (4 * std20 + 1e-9)
     d['BB_width'] = (bb_upper - bb_lower) / (sma20 + 1e-9)
 
+    # EMA ratios
     ema20  = close.ewm(span=20).mean()
     ema50  = close.ewm(span=50).mean()
     ema100 = close.ewm(span=100).mean()
-    d['EMA_ratio_20_50']  = ema20 / (ema50 + 1e-9)
+    d['EMA_ratio_20_50']  = ema20 / (ema50  + 1e-9)
     d['EMA_ratio_20_100'] = ema20 / (ema100 + 1e-9)
     d['EMA_ratio']        = d['EMA_ratio_20_50']
 
+    # Volume
     vol_sma20      = vol.rolling(20).mean()
     d['Vol_ratio'] = vol / (vol_sma20 + 1e-9)
 
+    # OBV
     obv           = (np.sign(close.diff()) * vol).fillna(0).cumsum()
     obv_sma20     = obv.rolling(20).mean()
     d['OBV_norm'] = (obv - obv_sma20) / (obv.rolling(20).std() + 1e-9)
 
-    tp            = (high + low + close) / 3
-    mf            = tp * vol
-    pos_mf        = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
-    neg_mf        = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
-    d['MFI_14']   = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
+    # MFI
+    tp          = (high + low + close) / 3
+    mf          = tp * vol
+    pos_mf      = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
+    neg_mf      = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
+    d['MFI_14'] = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
 
+    # StochRSI
     rsi14           = d['RSI_14']
     stoch_min       = rsi14.rolling(14).min()
     stoch_max       = rsi14.rolling(14).max()
@@ -125,13 +237,16 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['StochRSI_K'] = stoch_k
     d['StochRSI_D'] = stoch_k.rolling(3).mean()
 
+    # Williams %R
     hw14           = high.rolling(14).max()
     lw14           = low.rolling(14).min()
     d['WilliamsR'] = (hw14 - close) / (hw14 - lw14 + 1e-9) * -100
 
+    # Z-Score
     d['ZScore_20'] = (close - close.rolling(20).mean()) / (close.rolling(20).std() + 1e-9)
     d['ZScore_50'] = (close - close.rolling(50).mean()) / (close.rolling(50).std() + 1e-9)
 
+    # ADX
     up   = high.diff()
     down = -low.diff()
     pdm  = up.where((up > down)   & (up > 0),   0)
@@ -141,19 +256,26 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     dx   = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
     d['ADX'] = dx.ewm(alpha=1/14).mean()
 
+    # Свечные паттерны
     d['Body_pct']   = (close - d['Open']).abs() / (d['Open'] + 1e-9) * 100
     d['Upper_wick'] = (high - d[['Close','Open']].max(axis=1)) / (d['Open'] + 1e-9) * 100
     d['Lower_wick'] = (d[['Close','Open']].min(axis=1) - low) / (d['Open'] + 1e-9) * 100
     d['Doji']       = ((d['Body_pct'] / (high - low + 1e-9)) < 0.1).astype(int)
 
+    # Momentum
     d['Momentum_10'] = close - close.shift(10)
     d['ROC_10']      = close.pct_change(10) * 100
 
+    # Returns
     for h in [1, 4, 12, 24]:
         d[f'Return_{h}h'] = close.pct_change(h) * 100
 
     return d.dropna()
 
+
+# ===============================================================
+# ИНДИКАТОРЫ 4H
+# ===============================================================
 
 def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     d     = df4h.copy()
@@ -207,6 +329,10 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     return d.dropna()
 
 
+# ===============================================================
+# BTC MACRO FILTER
+# ===============================================================
+
 def get_btc_4h_change(exchange) -> float:
     try:
         ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe='4h', limit=5)
@@ -218,22 +344,54 @@ def get_btc_4h_change(exchange) -> float:
         return 0.0
 
 
+# ===============================================================
+# MARKET REGIME DETECTION
+# Адаптируем порог уверенности под режим рынка.
+# Боковик и высокая волатильность требуют большей уверенности.
+# ===============================================================
+
+def detect_market_regime(adx: float, atr_ratio: float, bb_width: float) -> dict:
+    """
+    TRENDING  — ADX > 30, нормальная волатильность -> порог стандартный (x1.00)
+    RANGING   — ADX < 20, узкий BB                -> требуем больше     (x1.15)
+    VOLATILE  — ATR выше нормы в 1.8x              -> требуем больше     (x1.25)
+    NEUTRAL   — всё остальное                      -> чуть выше          (x1.05)
+    """
+    if adx > 30 and atr_ratio < 1.5:
+        return {"regime": "TRENDING",  "mult": 1.00, "note": f"Тренд ADX={adx:.1f}"}
+    elif adx < 20 and bb_width < 0.05:
+        return {"regime": "RANGING",   "mult": 1.15, "note": f"Боковик ADX={adx:.1f}"}
+    elif atr_ratio > 1.8:
+        return {"regime": "VOLATILE",  "mult": 1.25, "note": f"Волатильность ATR_r={atr_ratio:.2f}"}
+    else:
+        return {"regime": "NEUTRAL",   "mult": 1.05, "note": f"Нейтральный ADX={adx:.1f}"}
+
+
+# ===============================================================
+# PERCENTILE FILTER
+# ===============================================================
+
 def _percentile_filter(confidence: float) -> bool:
-    """Возвращает True если уверенность выше порогового перцентиля."""
     global _confidence_history
     _confidence_history.append(confidence)
     if len(_confidence_history) > _HISTORY_MAX:
         _confidence_history = _confidence_history[-_HISTORY_MAX:]
-
     if len(_confidence_history) < 10:
-        return True   # мало истории — пропускаем фильтр
-
+        return True
     threshold = np.percentile(_confidence_history, CONFIDENCE_PERCENTILE)
     return confidence >= threshold
 
 
+# ===============================================================
+# ЗАГРУЗКА МОДЕЛЕЙ
+# ===============================================================
+
 def _load_models() -> dict:
-    """Загружает все 4 бинарные модели."""
+    """
+    Загружает все модели.
+    Базовые:  buy_xgb, buy_lgbm, sell_xgb, sell_lgbm
+    Мета:     meta_buy, meta_sell (создаются auto_trainer.py — опциональны)
+    """
     models = {}
 
     for key, path in [
@@ -248,16 +406,114 @@ def _load_models() -> dict:
             except Exception as e:
                 logger.warning(f"[Signal] Не удалось загрузить {path}: {e}")
 
+    for key, path in [
+        ('meta_buy',  META_MODEL_BUY_PATH),
+        ('meta_sell', META_MODEL_SELL_PATH),
+    ]:
+        if os.path.exists(path):
+            try:
+                models[key] = joblib.load(path)
+                logger.info(f"[Signal] Мета-модель загружена: {path}")
+            except Exception as e:
+                logger.warning(f"[Signal] Мета-модель {path}: {e}")
+
     return models
 
 
-def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
-    try:
-        # 1. Загружаем модели
-        models = _load_models()
+# ===============================================================
+# META-MODEL INFERENCE
+# Совместимо с auto_trainer.py v6.0:
+# там мета-модель обучена на [original_features + p_side_model]
+# ===============================================================
 
+def _apply_meta_filter(
+    models:     dict,
+    X:          np.ndarray,
+    p_base:     float,
+    model_key:  str,
+    signal_dir: str,
+) -> tuple:
+    """
+    Применяет мета-модель как фильтр.
+    auto_trainer обучает её на X + [p_side_model] — добавляем p_base последней фичей.
+    Возвращает (p_meta, meta_passed).
+    Если мета-модели нет — возвращает (None, True) и не блокирует.
+    """
+    if model_key not in models:
+        return None, True
+
+    try:
+        X_meta  = np.hstack([X, np.array([[p_base]])])
+        p_meta  = float(models[model_key].predict_proba(X_meta)[0][1])
+        passed  = p_meta >= 0.50
+        logger.debug(f"[Meta] {signal_dir}: p_meta={p_meta:.1%} {'OK' if passed else 'BLOCK'}")
+        return p_meta, passed
+    except Exception as e:
+        logger.warning(f"[Meta] Ошибка {model_key}: {e}")
+        return None, True
+
+
+# ===============================================================
+# FUNDING RATE КОРРЕКЦИЯ
+# ===============================================================
+
+def _apply_funding_correction(
+    signal:     str,
+    confidence: float,
+    funding:    dict,
+    threshold:  float,
+) -> tuple:
+    """
+    Снижает уверенность если рынок перегрет в сторону сигнала.
+    Возвращает (новый_сигнал, новая_уверенность, заметка).
+    """
+    funding_rate = funding.get("funding_rate", 0.0)
+    oi_change    = funding.get("oi_change_pct", 0.0)
+    bias         = funding.get("funding_bias", "neutral")
+    note         = ""
+
+    if signal == "BUY" and bias == "long_crowded":
+        confidence = confidence * 0.90
+        note = f"Funding={funding_rate:.4%} long_crowded -10%"
+
+    elif signal == "BUY" and oi_change < -2.0:
+        confidence = confidence * 0.92
+        note = f"OI_delta={oi_change:+.1f}% -8%"
+
+    elif signal == "SELL" and bias == "short_crowded":
+        confidence = confidence * 0.88
+        note = f"Funding={funding_rate:.4%} short_crowded -12%"
+
+    if signal != "HOLD" and confidence < threshold:
+        note += f" -> ниже порога {threshold:.1%}"
+        signal = "HOLD"
+
+    return signal, confidence, note
+
+
+# ===============================================================
+# ГЛАВНАЯ ФУНКЦИЯ
+# ===============================================================
+
+def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
+    """
+    Полный pipeline v6.0:
+      1. Загружаем модели (базовые + мета)
+      2. Получаем 1H + 4H свечи + Funding Rate
+      3. Считаем индикаторы
+      4. Layer 1: XGB + LGBM -> p_buy, p_sell
+      5. Market Regime -> адаптивный порог
+      6. Layer 2: Meta-model фильтр
+      7. Фильтры: percentile -> ADX -> 4H MTF -> BTC -> Funding
+      8. Возвращаем результат
+    """
+    try:
+        start_ts = time.time()
+
+        # 1. Модели
+        models = _load_models()
         if 'buy_xgb' not in models and 'sell_xgb' not in models:
-            logger.warning("[Signal] Модели не найдены")
+            logger.warning("[Signal] Нет ни одной модели")
             return None
 
         feature_cols = load_feature_cols()
@@ -283,6 +539,9 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             except Exception as e:
                 logger.warning(f"[Signal] 4H ошибка: {e}")
 
+        # Funding Rate (тихо если недоступен)
+        funding_data = get_funding_data(symbol)
+
         # 3. Вектор фичей
         last_1h  = df1h_feats.iloc[-1]
         row_data = {}
@@ -296,62 +555,83 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
 
         X = np.array([[row_data[c] for c in feature_cols]], dtype=np.float32)
 
-        # 4. Вероятности от бинарных моделей
-        # BUY
-        p_buy_list = []
-        if 'buy_xgb' in models:
-            p_buy_list.append(float(models['buy_xgb'].predict_proba(X)[0][1]))
-        if 'buy_lgbm' in models:
-            p_buy_list.append(float(models['buy_lgbm'].predict_proba(X)[0][1]))
-        p_buy = float(np.mean(p_buy_list)) if p_buy_list else 0.0
+        # 4. Layer 1: базовые вероятности
+        p_buy_xgb   = float(models['buy_xgb'].predict_proba(X)[0][1])   if 'buy_xgb'   in models else 0.0
+        p_buy_lgbm  = float(models['buy_lgbm'].predict_proba(X)[0][1])  if 'buy_lgbm'  in models else p_buy_xgb
+        p_sell_xgb  = float(models['sell_xgb'].predict_proba(X)[0][1])  if 'sell_xgb'  in models else 0.0
+        p_sell_lgbm = float(models['sell_lgbm'].predict_proba(X)[0][1]) if 'sell_lgbm' in models else p_sell_xgb
 
-        # SELL
-        p_sell_list = []
-        if 'sell_xgb' in models:
-            p_sell_list.append(float(models['sell_xgb'].predict_proba(X)[0][1]))
-        if 'sell_lgbm' in models:
-            p_sell_list.append(float(models['sell_lgbm'].predict_proba(X)[0][1]))
-        p_sell = float(np.mean(p_sell_list)) if p_sell_list else 0.0
+        p_buy  = (p_buy_xgb  + p_buy_lgbm)  / 2.0
+        p_sell = (p_sell_xgb + p_sell_lgbm) / 2.0
 
-        models_used = "+".join(
-            ([f"XGB"] if 'buy_xgb' in models else []) +
-            ([f"LGBM"] if 'buy_lgbm' in models else [])
-        )
+        models_used = "+".join(filter(None, [
+            "XGB"  if 'buy_xgb'  in models else "",
+            "LGBM" if 'buy_lgbm' in models else "",
+        ]))
 
-        # 5. Определяем сигнал
-        # Если оба сильные — берём максимальный
-        if p_buy >= MIN_CONFIDENCE and p_sell >= MIN_CONFIDENCE:
-            if p_buy >= p_sell:
-                signal, confidence = "BUY", p_buy
-            else:
-                signal, confidence = "SELL", p_sell
-        elif p_buy >= MIN_CONFIDENCE:
-            signal, confidence = "BUY", p_buy
-        elif p_sell >= MIN_CONFIDENCE:
+        # 5. Market Regime -> адаптивный порог
+        adx_1h    = float(last_1h.get('ADX',       25.0))
+        atr_ratio = float(last_1h.get('ATR_ratio',  1.0))
+        bb_width  = float(last_1h.get('BB_width',  0.05))
+        rsi_14    = float(last_1h.get('RSI_14',    50.0))
+        vol_ratio = float(last_1h.get('Vol_ratio',  1.0))
+
+        regime              = detect_market_regime(adx_1h, atr_ratio, bb_width)
+        regime_mult         = regime["mult"]
+        effective_threshold = MIN_CONFIDENCE * regime_mult
+
+        # 6. Первичный сигнал
+        if p_buy >= effective_threshold and p_sell >= effective_threshold:
+            signal, confidence = ("BUY", p_buy) if p_buy >= p_sell else ("SELL", p_sell)
+        elif p_buy >= effective_threshold:
+            signal, confidence = "BUY",  p_buy
+        elif p_sell >= effective_threshold:
             signal, confidence = "SELL", p_sell
         else:
             signal, confidence = "HOLD", max(p_buy, p_sell)
 
-        # 6. Перцентильный фильтр
+        # 7. Layer 2: Meta-model фильтр
+        p_meta_buy   = None
+        p_meta_sell  = None
+        meta_blocked = False
+
+        if signal == "BUY" and 'meta_buy' in models:
+            p_meta_buy, meta_ok = _apply_meta_filter(
+                models, X, p_buy, 'meta_buy', 'BUY'
+            )
+            if not meta_ok:
+                logger.info(f"[Signal] Meta-BUY заблокировал: p_meta={p_meta_buy:.1%}")
+                signal       = "HOLD"
+                meta_blocked = True
+
+        elif signal == "SELL" and 'meta_sell' in models:
+            p_meta_sell, meta_ok = _apply_meta_filter(
+                models, X, p_sell, 'meta_sell', 'SELL'
+            )
+            if not meta_ok:
+                logger.info(f"[Signal] Meta-SELL заблокировал: p_meta={p_meta_sell:.1%}")
+                signal       = "HOLD"
+                meta_blocked = True
+
+        # 8. Фильтр-цепочка
+        filter_log = []
+
+        # 8a. Перцентильный фильтр
         if signal != "HOLD":
             if not _percentile_filter(confidence):
-                logger.info(
-                    f"[Signal] 📊 Перцентильный фильтр: conf={confidence:.1%} "
-                    f"< {CONFIDENCE_PERCENTILE}th перцентиль → HOLD"
-                )
+                filter_log.append(f"PERCENTILE_LOW_{confidence:.1%}")
                 signal = "HOLD"
 
-        # 7. ADX фильтр
-        adx_1h = float(last_1h.get('ADX', 25.0))
+        # 8b. ADX фильтр
         if REGIME_FILTER_ENABLED and signal != "HOLD" and adx_1h < REGIME_ADX_THRESHOLD:
-            logger.info(f"[Signal] 🔕 ADX={adx_1h:.1f} < {REGIME_ADX_THRESHOLD} → HOLD")
+            filter_log.append(f"ADX={adx_1h:.1f}<{REGIME_ADX_THRESHOLD}")
             signal = "HOLD"
 
-        # 8. Multi-TF 4H фильтр
+        # 8c. Multi-TF 4H фильтр
         mtf_confirmed = True
         if MTF_ENABLED and df4h_feats is not None and signal != "HOLD":
             last_4h      = df4h_feats.iloc[-1]
-            rsi_4h       = float(last_4h.get('RSI_14_4h', 50))
+            rsi_4h       = float(last_4h.get('RSI_14_4h',  50.0))
             ema_ratio_4h = float(last_4h.get('EMA_ratio_4h', 1.0))
 
             if signal == "BUY":
@@ -360,54 +640,104 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 mtf_ok = (ema_ratio_4h < 1.005) and (rsi_4h < 60)
 
             if not mtf_ok:
-                logger.info(
-                    f"[Signal] 🔕 4H фильтр: RSI={rsi_4h:.1f} "
-                    f"EMA_ratio={ema_ratio_4h:.4f} → HOLD"
-                )
+                filter_log.append(f"4H_RSI={rsi_4h:.0f}_EMA={ema_ratio_4h:.4f}")
                 signal        = "HOLD"
                 mtf_confirmed = False
 
-        # 9. BTC macro-фильтр
+        # 8d. BTC macro фильтр
         btc_change  = 0.0
         btc_blocked = False
         if BTC_FILTER_ENABLED and signal == "BUY":
             btc_change = get_btc_4h_change(exchange)
             if btc_change < BTC_CORRELATION_THRESH:
-                logger.info(f"[Signal] 🔕 BTC 4H={btc_change:+.2f}% → блок BUY")
+                filter_log.append(f"BTC_4H={btc_change:+.2f}%")
                 signal      = "HOLD"
                 btc_blocked = True
 
-        # 10. Мета-данные
+        # 8e. Funding Rate коррекция
+        funding_note = ""
+        if signal != "HOLD":
+            signal, confidence, funding_note = _apply_funding_correction(
+                signal, confidence, funding_data, effective_threshold
+            )
+            if funding_note:
+                filter_log.append("FUNDING_ADJ")
+
+        # 9. Финальные данные
         cur_price   = float(last_1h['Close'])
-        current_atr = float(last_1h.get('ATR', 0.0))
+        current_atr = float(last_1h.get('ATR',       0.0))
         change_24h  = float(last_1h.get('Return_24h', 0.0))
-        volume      = float(last_1h.get('Volume', 0.0))
+        volume      = float(last_1h.get('Volume',     0.0))
+        elapsed     = round(time.time() - start_ts, 2)
+
+        p_meta = p_meta_buy if p_meta_buy is not None else p_meta_sell
+        if 'meta_buy' in models or 'meta_sell' in models:
+            models_used += "+META"
 
         logger.info(
-            f"[Signal] {signal} | "
-            f"p_buy={p_buy:.1%} p_sell={p_sell:.1%} | "
-            f"Conf={confidence:.1%} | Models={models_used} | "
-            f"ADX={adx_1h:.1f} | 4H={'✅' if mtf_confirmed else '❌'} | "
-            f"BTC={btc_change:+.2f}% | Price=${cur_price:.4f}"
+            f"[Signal v6.0] {signal} | "
+            f"p_buy={p_buy:.1%}(xgb={p_buy_xgb:.1%} lgbm={p_buy_lgbm:.1%}) | "
+            f"p_sell={p_sell:.1%}(xgb={p_sell_xgb:.1%} lgbm={p_sell_lgbm:.1%}) | "
+            f"meta={'OK' if not meta_blocked else 'BLOCK'} | "
+            f"Regime={regime['regime']}x{regime_mult:.2f} | "
+            f"ADX={adx_1h:.1f} | 4H={'OK' if mtf_confirmed else 'NO'} | "
+            f"BTC={btc_change:+.2f}% | "
+            f"Funding={funding_data.get('funding_rate', 0):.4%} "
+            f"OI={funding_data.get('oi_change_pct', 0):+.1f}% | "
+            f"Price=${cur_price:.4f} | filters={filter_log} | {elapsed}s"
         )
 
         return {
+            # Основной сигнал
             "signal":        signal,
-            "confidence":    confidence,
-            "p_buy":         p_buy,
-            "p_sell":        p_sell,
+            "confidence":    round(confidence, 4),
+
+            # Layer 1: базовые вероятности
+            "p_buy":         round(p_buy,       4),
+            "p_sell":        round(p_sell,      4),
+            "p_buy_xgb":     round(p_buy_xgb,   4),
+            "p_buy_lgbm":    round(p_buy_lgbm,  4),
+            "p_sell_xgb":    round(p_sell_xgb,  4),
+            "p_sell_lgbm":   round(p_sell_lgbm, 4),
+
+            # Layer 2: мета-модель
+            "p_meta":        round(p_meta, 4) if p_meta is not None else None,
+            "meta_blocked":  meta_blocked,
+            "models_used":   models_used,
+
+            # Рыночный контекст
             "price":         cur_price,
             "atr":           current_atr,
             "change_24h":    change_24h,
             "volume":        volume,
-            "adx":           adx_1h,
-            "models_used":   models_used,
+            "adx":           round(adx_1h, 2),
+            "rsi14":         round(rsi_14,  2),
+
+            # Режим рынка
+            "regime":        regime["regime"],
+            "regime_note":   regime["note"],
+            "regime_mult":   regime_mult,
+            "eff_threshold": round(effective_threshold, 4),
+
+            # Order Flow
+            "funding_rate":  funding_data.get("funding_rate",  0.0),
+            "oi_change_pct": funding_data.get("oi_change_pct", 0.0),
+            "funding_bias":  funding_data.get("funding_bias", "neutral"),
+            "funding_note":  funding_note,
+
+            # Фильтры
             "mtf_confirmed": mtf_confirmed,
             "btc_change_4h": btc_change,
             "btc_blocked":   btc_blocked,
-            # Совместимость с app.py
-            "xgb_signal":    signal,
-            "lgbm_signal":   signal,
+            "filter_log":    filter_log,
+
+            # Совместимость со старым app.py
+            "xgb_signal":   signal,
+            "lgbm_signal":  signal,
+
+            # Служебное
+            "inference_ms": int(elapsed * 1000),
+            "timestamp":    datetime.utcnow().isoformat(),
         }
 
     except Exception as e:

@@ -148,7 +148,7 @@ def calc_hurst_exponent(ts: pd.Series, lags_range: range = range(2, 21)) -> pd.S
 
     # Скользящее окно 100 баров
     result = ts.rolling(window=100, min_periods=50).apply(
-        lambda x: hurst_single(x.values), raw=True
+        lambda x: hurst_single(x), raw=True
     )
     return result
 

@@ -1,12 +1,10 @@
 """
-live_signal.py v4.0 — Многомодельный сигнал с Multi-TF фильтрацией
-v4.0 изменения:
-  - Ансамбль XGBoost + LightGBM (консенсус обеих моделей)
-  - 4H timeframe фильтр: сигнал открывается только при совпадении тренда
-  - BTC macro-фильтр: блокируем BUY при падении BTC > 3% на 4H
-  - Market Regime фильтр: ADX < 20 = флэт = HOLD
-  - 40+ признаков (динамическая загрузка feature_cols из JSON)
-  - Уверенность ансамбля = avg(XGB_prob, LGBM_prob)
+live_signal.py v4.1 — Многомодельный сигнал с Multi-TF фильтрацией
+ИСПРАВЛЕНО v4.1:
+  - Консенсус-фильтр смягчён: блокирует только если XGB и LGBM дают РАЗНЫЕ торговые сигналы
+    (XGB=BUY, LGBM=SELL), но не блокирует если один говорит HOLD
+  - 4H фильтр смягчён: RSI порог расширен (40/60 вместо 45/55)
+  - Уверенность при HOLD теперь берётся из max(ensemble_probs) для корректного логирования
 """
 
 import ccxt
@@ -30,9 +28,6 @@ logger = logging.getLogger(__name__)
 OKX_CONFIG = {'options': {'defaultType': 'spot'}, 'timeout': 30000}
 
 
-# ─────────────────────────────────────────────
-# Утилиты
-# ─────────────────────────────────────────────
 def _get_exchange():
     return ccxt.okx(OKX_CONFIG)
 
@@ -44,9 +39,6 @@ def _to_df(ohlcv: list) -> pd.DataFrame:
     return df.astype(float)
 
 
-# ─────────────────────────────────────────────
-# Загрузка фичей из сохранённого JSON
-# ─────────────────────────────────────────────
 def load_feature_cols() -> list:
     features_path = MODEL_PATH.replace('.pkl', '_features.json')
     if os.path.exists(features_path):
@@ -54,14 +46,10 @@ def load_feature_cols() -> list:
             cols = json.load(f)
         logger.info(f"[Signal] Загружено {len(cols)} фичей из {features_path}")
         return cols
-    # Фоллбэк
     logger.warning("[Signal] features.json не найден — используем FEATURE_COLS из config")
     return FEATURE_COLS
 
 
-# ─────────────────────────────────────────────
-# 1H индикаторы
-# ─────────────────────────────────────────────
 def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     close = d['Close']
@@ -163,9 +151,6 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     return d.dropna()
 
 
-# ─────────────────────────────────────────────
-# 4H индикаторы (для фильтра и фичей модели)
-# ─────────────────────────────────────────────
 def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     d = df4h.copy()
     close = d['Close']
@@ -218,11 +203,7 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     return d.dropna()
 
 
-# ─────────────────────────────────────────────
-# BTC macro-фильтр
-# ─────────────────────────────────────────────
 def get_btc_4h_change(exchange) -> float:
-    """Возвращает 4H изменение BTC в % (последняя закрытая свеча)."""
     try:
         ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe='4h', limit=5)
         if not ohlcv or len(ohlcv) < 2:
@@ -235,12 +216,8 @@ def get_btc_4h_change(exchange) -> float:
         return 0.0
 
 
-# ─────────────────────────────────────────────
-# Получение сигнала ансамбля
-# ─────────────────────────────────────────────
 def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
     try:
-        # 1. Загрузка моделей
         if not os.path.exists(MODEL_PATH):
             logger.warning(f"[Signal] XGBoost модель не найдена: {MODEL_PATH}")
             return None
@@ -254,10 +231,8 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             except Exception:
                 pass
 
-        # 2. Загружаем список фичей
         feature_cols = load_feature_cols()
 
-        # 3. Загружаем 1H данные (200 свечей = достаточно для всех индикаторов)
         exchange = _get_exchange()
         ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
 
@@ -271,7 +246,6 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         if df1h_feats.empty:
             return None
 
-        # 4. Загружаем 4H данные
         df4h_feats = None
         if MTF_ENABLED:
             try:
@@ -282,7 +256,6 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             except Exception as e:
                 logger.warning(f"[Signal] 4H данные — ошибка: {e}")
 
-        # 5. Собираем признаки: 1H + 4H (последняя строка)
         last_1h  = df1h_feats.iloc[-1]
         row_data = {}
 
@@ -290,21 +263,18 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             if col in df1h_feats.columns:
                 row_data[col] = float(last_1h[col])
             elif col.endswith('_4h') or col.endswith('_4h_tf'):
-                # 4H признак
                 if df4h_feats is not None and col in df4h_feats.columns:
                     row_data[col] = float(df4h_feats.iloc[-1][col])
                 else:
-                    row_data[col] = 0.0  # fallback
+                    row_data[col] = 0.0
             else:
                 row_data[col] = 0.0
 
         X = np.array([[row_data[c] for c in feature_cols]], dtype=np.float32)
 
-        # 6. XGBoost предсказание
         xgb_pred  = int(xgb_model.predict(X)[0])
         xgb_probs = xgb_model.predict_proba(X)[0]
 
-        # 7. LightGBM предсказание (если доступен)
         lgbm_pred  = None
         lgbm_probs = None
         if lgbm_model is not None:
@@ -314,7 +284,6 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             except Exception as e:
                 logger.warning(f"[Signal] LGBM предсказание — ошибка: {e}")
 
-        # 8. Ансамбль: усредняем вероятности
         if lgbm_probs is not None:
             ensemble_probs = (xgb_probs + lgbm_probs) / 2.0
             models_used    = "XGB+LGBM"
@@ -328,18 +297,25 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         signal_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
         signal     = signal_map.get(pred_class, "HOLD")
 
-        # 9. Консенсус-фильтр: оба должны согласиться
+        # ИСПРАВЛЕНО: консенсус блокирует только при ПРЯМОМ ПРОТИВОРЕЧИИ (BUY vs SELL)
+        # XGB=HOLD, LGBM=BUY → разрешаем (ансамбль решает по вероятностям)
+        # XGB=BUY,  LGBM=SELL → блокируем (противоположные сигналы)
+        xgb_signal  = signal_map.get(xgb_pred, "HOLD")
+        lgbm_signal = signal_map.get(lgbm_pred, "HOLD") if lgbm_pred is not None else "HOLD"
+
         if lgbm_pred is not None and signal != "HOLD":
-            lgbm_signal = signal_map.get(lgbm_pred, "HOLD")
-            xgb_signal  = signal_map.get(xgb_pred, "HOLD")
-            if xgb_signal != lgbm_signal:
+            direct_conflict = (
+                (xgb_signal == "BUY"  and lgbm_signal == "SELL") or
+                (xgb_signal == "SELL" and lgbm_signal == "BUY")
+            )
+            if direct_conflict:
                 logger.info(
-                    f"[Signal] ⚠️ Нет консенсуса: XGB={xgb_signal} LGBM={lgbm_signal} → HOLD"
+                    f"[Signal] ⚠️ Прямой конфликт: XGB={xgb_signal} LGBM={lgbm_signal} → HOLD"
                 )
                 signal     = "HOLD"
-                confidence = float(ensemble_probs[0])  # p_hold
+                confidence = float(ensemble_probs[0])
 
-        # 10. Market Regime фильтр
+        # Market Regime фильтр
         adx_1h = float(last_1h.get('ADX', 25.0))
         if REGIME_FILTER_ENABLED and signal != "HOLD":
             if adx_1h < REGIME_ADX_THRESHOLD:
@@ -348,7 +324,7 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 )
                 signal = "HOLD"
 
-        # 11. Multi-TF 4H фильтр
+        # Multi-TF 4H фильтр
         mtf_confirmed   = True
         mtf_description = "N/A"
 
@@ -358,12 +334,11 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
             ema_ratio_4h = float(last_4h.get('EMA_ratio_4h', 1.0))
             adx_4h       = float(last_4h.get('ADX_4h', 25))
 
+            # ИСПРАВЛЕНО: смягчены пороги RSI (было 45/55 → 40/60)
             if signal == "BUY":
-                # Подтверждение покупки: 4H в восходящем тренде
-                mtf_ok = (ema_ratio_4h > 1.0) and (rsi_4h > 45)
+                mtf_ok = (ema_ratio_4h > 0.995) and (rsi_4h > 40)
             else:  # SELL
-                # Подтверждение продажи: 4H в нисходящем тренде
-                mtf_ok = (ema_ratio_4h < 1.0) and (rsi_4h < 55)
+                mtf_ok = (ema_ratio_4h < 1.005) and (rsi_4h < 60)
 
             mtf_description = (
                 f"RSI_4h={rsi_4h:.1f} "
@@ -375,11 +350,11 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 logger.info(
                     f"[Signal] 🔕 4H фильтр отклонил {signal}: {mtf_description}"
                 )
-                signal      = "HOLD"
+                signal        = "HOLD"
                 mtf_confirmed = False
 
-        # 12. BTC macro-фильтр
-        btc_change = 0.0
+        # BTC macro-фильтр
+        btc_change  = 0.0
         btc_blocked = False
 
         if BTC_FILTER_ENABLED and signal == "BUY":
@@ -388,10 +363,9 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 logger.info(
                     f"[Signal] 🔕 BTC macro-фильтр: BTC 4H = {btc_change:+.2f}% → блок BUY"
                 )
-                signal     = "HOLD"
+                signal      = "HOLD"
                 btc_blocked = True
 
-        # 13. Итоговые данные
         cur_price   = float(last_1h['Close'])
         current_atr = float(last_1h.get('ATR', 0.0))
         change_24h  = float(last_1h.get('Return_24h', 0.0))
@@ -411,24 +385,23 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         )
 
         return {
-            "signal":         signal,
-            "confidence":     confidence,
-            "price":          cur_price,
-            "p_hold":         p_hold,
-            "p_buy":          p_buy,
-            "p_sell":         p_sell,
-            "change_24h":     change_24h,
-            "atr":            current_atr,
-            "volume":         volume,
-            "adx":            adx_1h,
-            # Мета-информация фильтров
-            "models_used":    models_used,
-            "mtf_confirmed":  mtf_confirmed,
-            "mtf_info":       mtf_description,
-            "btc_change_4h":  btc_change,
-            "btc_blocked":    btc_blocked,
-            "xgb_signal":     signal_map.get(xgb_pred, "HOLD"),
-            "lgbm_signal":    signal_map.get(lgbm_pred, "HOLD") if lgbm_pred is not None else "N/A",
+            "signal":        signal,
+            "confidence":    confidence,
+            "price":         cur_price,
+            "p_hold":        p_hold,
+            "p_buy":         p_buy,
+            "p_sell":        p_sell,
+            "change_24h":    change_24h,
+            "atr":           current_atr,
+            "volume":        volume,
+            "adx":           adx_1h,
+            "models_used":   models_used,
+            "mtf_confirmed": mtf_confirmed,
+            "mtf_info":      mtf_description,
+            "btc_change_4h": btc_change,
+            "btc_blocked":   btc_blocked,
+            "xgb_signal":    xgb_signal,
+            "lgbm_signal":   lgbm_signal,
         }
 
     except Exception as e:

@@ -1,39 +1,65 @@
 """
 backtest_engine.py — Бэктест стратегии на исторических данных.
 Запускается каждые 12 часов из app.py
+ИСПРАВЛЕНО: пагинация OKX (получаем реальные 3000 свечей)
 """
 
-import ccxt
+import requests
 import pandas as pd
 import numpy as np
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
-# Единая конфигурация exchange  ✅ ИСПРАВЛЕНО
-OKX_CONFIG = {
-    'options': {'defaultType': 'spot'},
-    'timeout': 30000
-}
 
+def fetch_history(symbol: str = "TON-USDT",
+                  timeframe: str = "1H", limit: int = 3000) -> pd.DataFrame:
+    """Загружает свечи через OKX REST API с пагинацией."""
+    all_data = []
+    after    = None
+    fetched  = 0
+    per_req  = 300
 
-def fetch_history(symbol="TON/USDT",
-                  timeframe="1h", limit=3000) -> pd.DataFrame:
     try:
-        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО: spot вместо swap
-        ohlcv    = exchange.fetch_ohlcv(
-            symbol, timeframe=timeframe, limit=limit  # ✅ ИСПРАВЛЕНО: убрали ":USDT"
-        )
+        while fetched < limit:
+            url = (
+                f"https://www.okx.com/api/v5/market/history-candles"
+                f"?instId={symbol}&bar={timeframe}&limit={per_req}"
+            )
+            if after:
+                url += f"&after={after}"
+
+            r    = requests.get(url, timeout=15)
+            data = r.json().get("data", [])
+            if not data:
+                break
+
+            all_data.extend(data)
+            fetched += len(data)
+            after    = data[-1][0]   # ts самой старой свечи в батче
+            time.sleep(0.3)
+
+        if not all_data:
+            logger.error("[Backtest] Нет данных от OKX")
+            return pd.DataFrame()
+
         df = pd.DataFrame(
-            ohlcv,
-            columns=['ts', 'Open', 'High', 'Low', 'Close', 'Volume']
+            all_data,
+            columns=['ts', 'Open', 'High', 'Low', 'Close',
+                     'Volume', 'VolCcy', 'VolCcyQuote', 'Confirm']
         )
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        df[['Open', 'High', 'Low', 'Close', 'Volume']] = \
+            df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+        df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='ms')
         df.set_index('ts', inplace=True)
-        logger.info(f"[Backtest] ✅ Загружено {len(df)} свечей")
+        df = df.sort_index()
+
+        logger.info(f"[Backtest] ✅ Загружено {len(df)} свечей ({timeframe})")
         return df
+
     except Exception as e:
-        logger.error(f"[Backtest] ❌ Ошибка: {e}")
+        logger.error(f"[Backtest] ❌ Ошибка загрузки: {e}")
         return pd.DataFrame()
 
 
@@ -43,7 +69,7 @@ def _calc_rsi(series, period=14):
     loss     = -delta.clip(upper=0)
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs       = avg_gain / avg_loss
+    rs       = avg_gain / (avg_loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
 
@@ -67,7 +93,11 @@ def run_backtest(
 
     logger.info(f"[Backtest] 🔍 Старт: {limit} свечей...")
 
-    df = fetch_history(symbol, timeframe, limit)
+    # Конвертируем символ для OKX REST API
+    okx_symbol = symbol.replace("/", "-")  # TON/USDT → TON-USDT
+    okx_tf     = timeframe.upper()         # 1h → 1H
+
+    df = fetch_history(okx_symbol, okx_tf, limit)
     if df.empty:
         return {"success": False, "error": "Нет данных"}
 
@@ -127,30 +157,49 @@ def run_backtest(
         if not in_trade:
             signal = None
 
-            # BUY: RSI выходит из зоны перепроданности + EMA20 > EMA50
             if (prev['RSI'] < 35 and row['RSI'] >= 35
                     and row['EMA20'] > row['EMA50']):
                 signal = "BUY"
-
-            # SELL: RSI выходит из зоны перекупленности + EMA20 < EMA50
             elif (prev['RSI'] > 65 and row['RSI'] <= 65
                     and row['EMA20'] < row['EMA50']):
                 signal = "SELL"
 
             if signal:
+                # Динамический SL/TP на основе ATR
+                atr_val    = float(row['ATR'])
+                raw_sl     = (atr_val * 1.5) / float(row['Close'])
+                sl_pct_dyn = max(0.008, min(raw_sl, 0.04))
+                tp_pct_dyn = sl_pct_dyn * 2.0
+
                 amount_usd   = balance * trade_pct
-                trade_open   = row['Close']
+                trade_open   = float(row['Close'])
                 trade_signal = signal
                 in_trade     = True
 
                 if signal == "BUY":
-                    tp_price = trade_open * (1 + tp_pct)
-                    sl_price = trade_open * (1 - sl_pct)
+                    tp_price = trade_open * (1 + tp_pct_dyn)
+                    sl_price = trade_open * (1 - sl_pct_dyn)
                 else:
-                    tp_price = trade_open * (1 - tp_pct)
-                    sl_price = trade_open * (1 + sl_pct)
+                    tp_price = trade_open * (1 - tp_pct_dyn)
+                    sl_price = trade_open * (1 + sl_pct_dyn)
 
-    # Расчёт результатов
+    # Закрываем оставшуюся позицию
+    if in_trade:
+        last_close = float(df['Close'].iloc[-1])
+        if trade_signal == "BUY":
+            pnl_pct = (last_close - trade_open) / trade_open * 100
+        else:
+            pnl_pct = (trade_open - last_close) / trade_open * 100
+        pnl_usd = amount_usd * pnl_pct / 100
+        balance += pnl_usd
+        trades.append({
+            "signal": trade_signal,
+            "result": "WIN" if pnl_pct > 0 else "LOSS",
+            "pnl_pct": round(pnl_pct, 2),
+            "pnl_usd": round(pnl_usd, 2),
+        })
+
+    # Результаты
     total    = len(trades)
     wins     = sum(1 for t in trades if t["result"] == "WIN")
     losses   = total - wins
@@ -175,7 +224,7 @@ def run_backtest(
     result = {
         "success":       True,
         "symbol":        symbol,
-        "candles":       limit,
+        "candles":       len(df),
         "total_trades":  total,
         "wins":          wins,
         "losses":        losses,

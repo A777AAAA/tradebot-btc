@@ -1,12 +1,10 @@
 """
-auto_trainer.py v4.0 — Ансамбль XGBoost + LightGBM
-v4.0 изменения:
-  - Две модели: XGBoost + LightGBM (ансамбль голосованием)
-  - 40+ признаков: OBV, MFI, StochRSI, Z-score, BB_width, Williams%R, ROC, Momentum
-  - Multi-timeframe: 1h + 4h фичи
-  - Walk-Forward валидация (честная оценка без data leakage)
-  - SHAP feature importance для отбора лучших фич
-  - Автоматический отбор FEATURE_COLS на основе importance
+auto_trainer.py v4.1 — Ансамбль XGBoost + LightGBM
+ИСПРАВЛЕНО v4.1:
+  - Return_24h_tf гарантированно вычисляется в calc_indicators_4h
+  - Усиленная регуляризация XGB/LGBM (меньше переобучения)
+  - WF оценка теперь использует те же гиперпараметры что и финальная модель
+  - merge_timeframes: явный dropna после ffill
 """
 
 import os
@@ -43,9 +41,9 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# Загрузка OHLCV с OKX
+# Загрузка OHLCV с OKX (с пагинацией)
 # ─────────────────────────────────────────────
-def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 2400) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 3000) -> pd.DataFrame:
     all_data = []
     after    = None
     fetched  = 0
@@ -93,21 +91,18 @@ def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 2400) -> 
 
 
 # ─────────────────────────────────────────────
-# Расчёт 1H индикаторов (40+ признаков)
+# 1H индикаторы
 # ─────────────────────────────────────────────
 def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-
     close = d['Close']
     high  = d['High']
     low   = d['Low']
     vol   = d['Volume']
 
-    # ── Time features ─────────────────────
     d['Hour']      = d.index.hour
     d['DayOfWeek'] = d.index.dayofweek
 
-    # ── RSI 7, 14, 21 ─────────────────────
     for p in [7, 14, 21]:
         diff  = close.diff()
         g     = diff.clip(lower=0)
@@ -116,14 +111,12 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
         avg_l = l.ewm(com=p - 1, min_periods=p).mean()
         d[f'RSI_{p}'] = 100 - (100 / (1 + avg_g / (avg_l + 1e-9)))
 
-    # ── MACD ──────────────────────────────
     ema12            = close.ewm(span=12, adjust=False).mean()
     ema26            = close.ewm(span=26, adjust=False).mean()
     d['MACD']        = ema12 - ema26
     d['MACD_signal'] = d['MACD'].ewm(span=9, adjust=False).mean()
     d['MACD_hist']   = d['MACD'] - d['MACD_signal']
 
-    # ── ATR ───────────────────────────────
     tr  = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -134,43 +127,35 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['ATR']     = atr14
     d['ATR_pct'] = (atr14 / (close + 1e-9)) * 100
     d['ATR_norm'] = atr14 / (close + 1e-9)
-    d['ATR_ratio'] = atr14 / (atr50 + 1e-9)     # нормализованная волатильность
+    d['ATR_ratio'] = atr14 / (atr50 + 1e-9)
 
-    # ── Bollinger Bands ───────────────────
-    sma20       = close.rolling(20).mean()
-    std20       = close.rolling(20).std()
-    bb_upper    = sma20 + 2 * std20
-    bb_lower    = sma20 - 2 * std20
+    sma20        = close.rolling(20).mean()
+    std20        = close.rolling(20).std()
+    bb_upper     = sma20 + 2 * std20
+    bb_lower     = sma20 - 2 * std20
     d['BB_pos']  = (close - bb_lower) / (4 * std20 + 1e-9)
-    d['BB_width'] = (bb_upper - bb_lower) / (sma20 + 1e-9)  # нормализованная ширина
+    d['BB_width'] = (bb_upper - bb_lower) / (sma20 + 1e-9)
 
-    # ── EMA ratios (тренд) ────────────────
     ema20  = close.ewm(span=20).mean()
     ema50  = close.ewm(span=50).mean()
     ema100 = close.ewm(span=100).mean()
     d['EMA_ratio_20_50']  = ema20 / (ema50 + 1e-9)
     d['EMA_ratio_20_100'] = ema20 / (ema100 + 1e-9)
+    d['EMA_ratio']        = d['EMA_ratio_20_50']
 
-    # Обратная совместимость
-    d['EMA_ratio'] = d['EMA_ratio_20_50']
-
-    # ── Volume indicators ─────────────────
     vol_sma20     = vol.rolling(20).mean()
     d['Vol_ratio'] = vol / (vol_sma20 + 1e-9)
 
-    # OBV (On-Balance Volume)
     obv        = (np.sign(close.diff()) * vol).fillna(0).cumsum()
     obv_sma20  = obv.rolling(20).mean()
     d['OBV_norm'] = (obv - obv_sma20) / (obv.rolling(20).std() + 1e-9)
 
-    # MFI (Money Flow Index, period=14)
     tp       = (high + low + close) / 3
     mf       = tp * vol
     pos_mf   = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
     neg_mf   = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
     d['MFI_14'] = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-9)))
 
-    # ── Stochastic RSI ────────────────────
     rsi14     = d['RSI_14']
     stoch_min = rsi14.rolling(14).min()
     stoch_max = rsi14.rolling(14).max()
@@ -178,16 +163,13 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['StochRSI_K'] = stoch_k
     d['StochRSI_D'] = stoch_k.rolling(3).mean()
 
-    # ── Williams %R ───────────────────────
     hw14 = high.rolling(14).max()
     lw14 = low.rolling(14).min()
     d['WilliamsR'] = (hw14 - close) / (hw14 - lw14 + 1e-9) * -100
 
-    # ── Z-score цены ──────────────────────
     d['ZScore_20'] = (close - close.rolling(20).mean()) / (close.rolling(20).std() + 1e-9)
     d['ZScore_50'] = (close - close.rolling(50).mean()) / (close.rolling(50).std() + 1e-9)
 
-    # ── ADX ───────────────────────────────
     up   = high.diff()
     down = -low.diff()
     pdm  = up.where((up > down)   & (up > 0),   0)
@@ -197,18 +179,15 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     dx   = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
     d['ADX'] = dx.ewm(alpha=1 / 14).mean()
 
-    # ── Candle patterns ───────────────────
     d['Body_pct']   = (close - d['Open']).abs() / (d['Open'] + 1e-9) * 100
     d['Upper_wick'] = (high - d[['Close', 'Open']].max(axis=1)) / (d['Open'] + 1e-9) * 100
     d['Lower_wick'] = (d[['Close', 'Open']].min(axis=1) - low) / (d['Open'] + 1e-9) * 100
     body_range      = (high - low + 1e-9)
     d['Doji']       = (d['Body_pct'] / body_range < 0.1).astype(int)
 
-    # ── Momentum ──────────────────────────
     d['Momentum_10'] = close - close.shift(10)
     d['ROC_10']      = close.pct_change(10) * 100
 
-    # ── Returns ───────────────────────────
     for h in [1, 4, 12, 24]:
         d[f'Return_{h}h'] = close.pct_change(h) * 100
 
@@ -216,7 +195,7 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# Расчёт 4H индикаторов
+# 4H индикаторы (ИСПРАВЛЕНО: Return_24h_tf гарантирован)
 # ─────────────────────────────────────────────
 def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     d = df4h.copy()
@@ -251,8 +230,10 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
     d['ATR_pct_4h'] = (atr14 / (close + 1e-9)) * 100
 
     d['Vol_ratio_4h']  = vol / (vol.rolling(20).mean() + 1e-9)
-    d['Return_4h_tf']  = close.pct_change(1) * 100
-    d['Return_24h_tf'] = close.pct_change(6) * 100  # 6 × 4h = 24h
+
+    # ИСПРАВЛЕНО: оба возврата гарантированы
+    d['Return_4h_tf']  = close.pct_change(1) * 100   # 1 свеча 4H = 4h
+    d['Return_24h_tf'] = close.pct_change(6) * 100   # 6 свечей 4H = 24h
 
     up   = high.diff()
     down = -low.diff()
@@ -271,26 +252,23 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# Слияние 1H + 4H (reindex с forward-fill)
+# Слияние 1H + 4H
 # ─────────────────────────────────────────────
 def merge_timeframes(df1h: pd.DataFrame, df4h: pd.DataFrame) -> pd.DataFrame:
-    """
-    Берём 4H признаки, reindex на 1H временную сетку.
-    Используем ffill (не смотрим в будущее!).
-    """
-    cols_4h = [c for c in df4h.columns if c.endswith('_4h') or c.endswith('_4h_tf')]
+    cols_4h  = [c for c in df4h.columns if c.endswith('_4h') or c.endswith('_4h_tf')]
     df4h_sub = df4h[cols_4h].copy()
 
-    # Переименовываем чтобы было понятно
-    df_merged = df1h.copy()
+    df_merged      = df1h.copy()
     df4h_reindexed = df4h_sub.reindex(df1h.index, method='ffill')
-    df_merged = pd.concat([df_merged, df4h_reindexed], axis=1)
+    df_merged      = pd.concat([df_merged, df4h_reindexed], axis=1)
 
+    # ИСПРАВЛЕНО: убираем строки где 4H фичи не заполнились
+    df_merged = df_merged.dropna(subset=cols_4h)
     return df_merged
 
 
 # ─────────────────────────────────────────────
-# Разметка таргета
+# Таргет
 # ─────────────────────────────────────────────
 def make_target(df: pd.DataFrame) -> pd.DataFrame:
     future   = df['Close'].shift(-TARGET_HORIZON)
@@ -316,10 +294,6 @@ def make_target(df: pd.DataFrame) -> pd.DataFrame:
 def walk_forward_eval(X: np.ndarray, y: np.ndarray,
                       train_size: int, test_size: int, step: int,
                       feature_cols: list) -> dict:
-    """
-    Скользящая оценка: обучаем на train_size, тестируем на test_size,
-    сдвигаем на step. Честная оценка — нет data leakage.
-    """
     results = []
     n = len(X)
     start = train_size
@@ -332,9 +306,12 @@ def walk_forward_eval(X: np.ndarray, y: np.ndarray,
 
         sw = compute_sample_weight("balanced", y_tr)
 
+        # ИСПРАВЛЕНО: те же гиперпараметры что и финальная модель
         m = XGBClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8,
+            n_estimators=300, max_depth=4, learning_rate=0.03,
+            subsample=0.75, colsample_bytree=0.7,
+            min_child_weight=10, gamma=0.2,
+            reg_alpha=0.3, reg_lambda=2.0,
             eval_metric='mlogloss', num_class=3,
             use_label_encoder=False, verbosity=0
         )
@@ -343,7 +320,7 @@ def walk_forward_eval(X: np.ndarray, y: np.ndarray,
         y_pred = m.predict(X_te)
         prec   = precision_score(y_te, y_pred, average='weighted', zero_division=0)
         acc    = accuracy_score(y_te, y_pred)
-        results.append({"precision": prec, "accuracy": acc, "n_test": len(y_te)})
+        results.append({"precision": prec, "accuracy": acc})
         start += step
 
     if not results:
@@ -357,7 +334,7 @@ def walk_forward_eval(X: np.ndarray, y: np.ndarray,
 
 
 # ─────────────────────────────────────────────
-# Определение рабочего набора фичей
+# Доступные фичи
 # ─────────────────────────────────────────────
 def get_available_features(df: pd.DataFrame, desired: list) -> list:
     available = [c for c in desired if c in df.columns]
@@ -368,21 +345,21 @@ def get_available_features(df: pd.DataFrame, desired: list) -> list:
 
 
 # ─────────────────────────────────────────────
-# Обучение XGBoost
+# Обучение XGBoost (ИСПРАВЛЕНО: сильнее регуляризация)
 # ─────────────────────────────────────────────
 def train_xgboost(X_train, y_train, X_test, y_test) -> tuple:
     sw = compute_sample_weight("balanced", y_train)
 
     model = XGBClassifier(
-        n_estimators      = 500,
-        max_depth         = 5,
-        learning_rate     = 0.02,
-        subsample         = 0.8,
-        colsample_bytree  = 0.75,
-        min_child_weight  = 7,
-        gamma             = 0.1,
-        reg_alpha         = 0.1,
-        reg_lambda        = 1.5,
+        n_estimators      = 300,    # ИСПРАВЛЕНО: было 500 → меньше переобучения
+        max_depth         = 4,      # ИСПРАВЛЕНО: было 5
+        learning_rate     = 0.03,   # ИСПРАВЛЕНО: было 0.02
+        subsample         = 0.75,   # ИСПРАВЛЕНО: было 0.8
+        colsample_bytree  = 0.70,   # ИСПРАВЛЕНО: было 0.75
+        min_child_weight  = 10,     # ИСПРАВЛЕНО: было 7 → больше регуляризация
+        gamma             = 0.2,    # ИСПРАВЛЕНО: было 0.1
+        reg_alpha         = 0.3,    # ИСПРАВЛЕНО: было 0.1
+        reg_lambda        = 2.0,    # ИСПРАВЛЕНО: было 1.5
         eval_metric       = 'mlogloss',
         num_class         = 3,
         use_label_encoder = False,
@@ -404,7 +381,7 @@ def train_xgboost(X_train, y_train, X_test, y_test) -> tuple:
 
 
 # ─────────────────────────────────────────────
-# Обучение LightGBM
+# Обучение LightGBM (ИСПРАВЛЕНО: сильнее регуляризация)
 # ─────────────────────────────────────────────
 def train_lightgbm(X_train, y_train, X_test, y_test) -> tuple:
     if not LGBM_AVAILABLE:
@@ -413,25 +390,25 @@ def train_lightgbm(X_train, y_train, X_test, y_test) -> tuple:
     sw = compute_sample_weight("balanced", y_train)
 
     model = lgb.LGBMClassifier(
-        n_estimators     = 500,
-        max_depth        = 5,
-        learning_rate    = 0.02,
-        subsample        = 0.8,
-        colsample_bytree = 0.75,
-        min_child_samples= 20,
-        reg_alpha        = 0.1,
-        reg_lambda       = 1.5,
-        num_class        = 3,
-        objective        = 'multiclass',
-        verbosity        = -1,
-        n_jobs           = -1,
+        n_estimators      = 300,    # ИСПРАВЛЕНО: было 500
+        max_depth         = 4,      # ИСПРАВЛЕНО: было 5
+        learning_rate     = 0.03,   # ИСПРАВЛЕНО: было 0.02
+        subsample         = 0.75,
+        colsample_bytree  = 0.70,
+        min_child_samples = 30,     # ИСПРАВЛЕНО: было 20 → меньше переобучения
+        reg_alpha         = 0.3,    # ИСПРАВЛЕНО: было 0.1
+        reg_lambda        = 2.0,    # ИСПРАВЛЕНО: было 1.5
+        num_class         = 3,
+        objective         = 'multiclass',
+        verbosity         = -1,
+        n_jobs            = -1,
     )
     model.fit(
         X_train, y_train,
-        sample_weight    = sw,
-        eval_set         = [(X_test, y_test)],
-        callbacks        = [lgb.early_stopping(50, verbose=False),
-                            lgb.log_evaluation(-1)],
+        sample_weight = sw,
+        eval_set      = [(X_test, y_test)],
+        callbacks     = [lgb.early_stopping(50, verbose=False),
+                         lgb.log_evaluation(-1)],
     )
 
     y_pred    = model.predict(X_test)
@@ -446,22 +423,22 @@ def train_lightgbm(X_train, y_train, X_test, y_test) -> tuple:
 # ГЛАВНАЯ: обучение ансамбля
 # ─────────────────────────────────────────────
 def train_model() -> dict:
-    logger.info("[Trainer] 🚀 v4.0: XGBoost + LightGBM ансамбль, Multi-TF, 40+ фич")
+    logger.info("[Trainer] 🚀 v4.1: XGBoost + LightGBM, Multi-TF, усиленная регуляризация")
 
-    # 1. Загружаем 1H и 4H данные
+    # 1. Загружаем данные
     df1h_raw = fetch_ohlcv("TON-USDT", "1H", 3000)
     df4h_raw = fetch_ohlcv("TON-USDT", "4H", 750)
 
     if df1h_raw.empty:
         return {"success": False, "error": "Нет 1H данных"}
 
-    # 2. Рассчитываем индикаторы
+    # 2. Индикаторы
     df1h = calc_indicators_1h(df1h_raw)
 
     if not df4h_raw.empty:
         df4h = calc_indicators_4h(df4h_raw)
         df   = merge_timeframes(df1h, df4h)
-        logger.info("[Trainer] ✅ Объединены 1H + 4H данные")
+        logger.info(f"[Trainer] ✅ Объединены 1H + 4H | строк после merge: {len(df)}")
     else:
         logger.warning("[Trainer] ⚠️ 4H данные недоступны — обучаем только на 1H")
         df = df1h
@@ -473,10 +450,9 @@ def train_model() -> dict:
     # 3. Таргет
     df = make_target(df)
 
-    # 4. Определяем доступные фичи
+    # 4. Выбор фичей
     feature_cols = get_available_features(df, FEATURE_COLS)
     if len(feature_cols) < 10:
-        # Фоллбэк на legacy
         feature_cols = get_available_features(df, FEATURE_COLS_LEGACY)
         logger.warning(f"[Trainer] Используем legacy features ({len(feature_cols)} шт)")
     else:
@@ -492,7 +468,7 @@ def train_model() -> dict:
 
     logger.info(f"[Trainer] Train: {len(X_train)} | Test: {len(X_test)}")
 
-    # 6. Walk-forward оценка (реалистичный backtest)
+    # 6. Walk-forward
     hours_per_day = 24
     wf_train = WF_TRAIN_DAYS * hours_per_day
     wf_test  = WF_TEST_DAYS  * hours_per_day
@@ -506,7 +482,7 @@ def train_model() -> dict:
         f"folds={wf_result['wf_folds']}"
     )
 
-    # 7. Обучение XGBoost
+    # 7. XGBoost
     logger.info("[Trainer] 🔧 Обучение XGBoost...")
     xgb_model, xgb_metrics = train_xgboost(X_train, y_train, X_test, y_test)
     logger.info(
@@ -520,7 +496,7 @@ def train_model() -> dict:
         target_names=['HOLD', 'BUY', 'SELL'], zero_division=0
     ))
 
-    # 8. Обучение LightGBM
+    # 8. LightGBM
     lgbm_model, lgbm_metrics = None, None
     if LGBM_AVAILABLE:
         logger.info("[Trainer] 🔧 Обучение LightGBM...")
@@ -535,18 +511,16 @@ def train_model() -> dict:
     else:
         logger.warning("[Trainer] LightGBM не установлен — только XGBoost")
 
-    # 9. Сохраняем модели
+    # 9. Сохраняем
     joblib.dump(xgb_model, MODEL_PATH)
-
     if lgbm_model:
         joblib.dump(lgbm_model, MODEL_PATH_LGBM)
 
-    # Сохраняем список фичей (для live_signal)
     features_path = MODEL_PATH.replace('.pkl', '_features.json')
     with open(features_path, 'w') as f:
         json.dump(feature_cols, f)
 
-    # 10. Итоговая статистика
+    # 10. Итоги
     ensemble_precision = xgb_metrics['precision']
     if lgbm_metrics:
         ensemble_precision = (xgb_metrics['precision'] + lgbm_metrics['precision']) / 2
@@ -557,18 +531,13 @@ def train_model() -> dict:
         "n_samples":          len(df),
         "n_train":            split,
         "n_test":             len(X_test),
-        # XGBoost
         "xgb_precision":      xgb_metrics['precision'],
         "xgb_accuracy":       xgb_metrics['accuracy'],
         "xgb_f1":             xgb_metrics['f1'],
-        # LightGBM
         "lgbm_precision":     lgbm_metrics['precision'] if lgbm_metrics else None,
         "lgbm_accuracy":      lgbm_metrics['accuracy']  if lgbm_metrics else None,
-        # Ансамбль
         "ensemble_precision": ensemble_precision,
-        # Walk-forward
         **wf_result,
-        # Совместимость
         "precision":          ensemble_precision,
         "accuracy":           xgb_metrics['accuracy'],
         "recall":             xgb_metrics['f1'],

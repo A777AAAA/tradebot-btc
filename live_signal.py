@@ -967,7 +967,7 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
         btc_change  = 0.0
         btc_blocked = False
         if BTC_FILTER_ENABLED and signal == "BUY":
-            btc_change = get_btc_4h_change(exchange)
+            btc_change = get_btc_4h_change()
             if btc_change < BTC_CORRELATION_THRESH:
                 filter_log.append(f"BTC_4H={btc_change:+.2f}%")
                 signal      = "HOLD"

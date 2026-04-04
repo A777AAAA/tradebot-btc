@@ -1,5 +1,5 @@
 """
-auto_trainer.py v8.0 — Калибровка вероятностей + 8000 свечей + Улучшенный Kelly
+auto_trainer.py v8.1 — Калибровка вероятностей + 8000 свечей + Улучшенный Kelly
 ИЗМЕНЕНИЯ v8.0 vs v7.0:
   - КАЛИБРОВКА ВЕРОЯТНОСТЕЙ: CalibratedClassifierCV (Isotonic Regression)
     Без калибровки p(BUY)=0.75 ≠ реальным 75% win rate.
@@ -82,46 +82,16 @@ BARS_4H = 4000   # было 750 → теперь ~667 дней на 4H
 # Загрузка OHLCV с OKX (пагинация)
 # ─────────────────────────────────────────────
 def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 8000) -> pd.DataFrame:
-    all_data = []
-    after    = None
-    fetched  = 0
-    limit    = 300
-
+    """Загружает свечи через okx_client с retry/backoff защитой."""
+    from okx_client import get_candles_multi, candles_to_df
     try:
-        while fetched < bars:
-            url = (
-                f"https://www.okx.com/api/v5/market/history-candles"
-                f"?instId={symbol}&bar={bar}&limit={limit}"
-            )
-            if after:
-                url += f"&after={after}"
-
-            r    = requests.get(url, timeout=15)
-            data = r.json().get("data", [])
-            if not data:
-                break
-
-            all_data.extend(data)
-            fetched += len(data)
-            after    = data[-1][0]
-            time.sleep(0.3)
-
-        if not all_data:
+        raw = get_candles_multi(symbol, bar, bars)
+        if not raw:
+            logger.error(f"[Trainer] Нет данных {bar}")
             return pd.DataFrame()
-
-        df = pd.DataFrame(
-            all_data,
-            columns=['ts', 'Open', 'High', 'Low', 'Close',
-                     'Volume', 'VolCcy', 'VolCcyQuote', 'Confirm']
-        )
-        df[['Open', 'High', 'Low', 'Close', 'Volume']] = \
-            df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
-        df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='ms')
-        df.set_index('ts', inplace=True)
-        df = df.sort_index()
+        df = candles_to_df(raw)
         logger.info(f"[Trainer] ✅ Загружено {len(df)} свечей ({bar})")
         return df
-
     except Exception as e:
         logger.error(f"[Trainer] Ошибка загрузки {bar}: {e}")
         return pd.DataFrame()

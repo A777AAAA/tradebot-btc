@@ -1,5 +1,5 @@
 """
-live_signal.py v8.0 — Реальный Order Book OFI + Regime-Switching + Калиброванные модели
+live_signal.py v8.1 — Реальный Order Book OFI + Regime-Switching + Калиброванные модели
 ИЗМЕНЕНИЯ v8.0 vs v7.0:
   - РЕАЛЬНЫЙ ORDER BOOK OFI: OKX API /api/v5/market/books
     Вместо OHLCV-прокси — настоящий дисбаланс bid/ask топ-10 уровней.
@@ -62,17 +62,35 @@ _OB_OFI_TTL = 120
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===============================================================
 
+def _okx_get(url: str, retries: int = 3) -> dict:
+    """GET запрос к OKX с retry + exponential backoff при 429."""
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 429:
+                wait = 2 ** attempt * 5
+                logger.warning(f"[Signal] Rate limit 429 — ждём {wait}с")
+                time.sleep(wait)
+                continue
+            if r.status_code != 200:
+                logger.error(f"[Signal] HTTP {r.status_code}: {url}")
+                return {}
+            return r.json()
+        except requests.exceptions.Timeout:
+            logger.warning(f"[Signal] Timeout (попытка {attempt+1})")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            logger.error(f"[Signal] Ошибка запроса: {e}")
+            time.sleep(2 ** attempt)
+    return {}
+
+
 def _fetch_candles(inst_id: str, bar: str = "1H", limit: int = 250, after: str = None) -> list:
-    """Получаем свечи через публичный REST OKX без ключей"""
+    """Получаем свечи через публичный REST OKX с retry."""
     url = f"{OKX_REST}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
     if after:
         url += f"&after={after}"
-    try:
-        r = requests.get(url, timeout=15)
-        return r.json().get("data", [])
-    except Exception as e:
-        logger.error(f"[Signal] fetch_candles error: {e}")
-        return []
+    return _okx_get(url).get("data", [])
 
 
 def _to_df_rest(data: list) -> pd.DataFrame:
@@ -246,15 +264,15 @@ def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
         # OKX REST: funding rate
         inst_id_swap = symbol_spot.replace("/", "-") + "-SWAP"
         fr_url = f"{OKX_REST}/api/v5/public/funding-rate?instId={inst_id_swap}"
-        fr_r   = requests.get(fr_url, timeout=10)
-        fr_d   = fr_r.json().get("data", [{}])
+        fr_d_raw = _okx_get(fr_url)
+        fr_d   = fr_d_raw.get("data", [{}])
         funding_rate = float(fr_d[0].get("fundingRate", 0.0)) if fr_d else 0.0
 
         oi_change_pct = 0.0
         try:
             oi_url = f"{OKX_REST}/api/v5/rubric/open-interest?instId={inst_id_swap}&period=1H&limit=3"
-            oi_r   = requests.get(oi_url, timeout=10)
-            oi_d   = oi_r.json().get("data", [])
+            oi_d_raw = _okx_get(oi_url)
+            oi_d   = oi_d_raw.get("data", [])
             if len(oi_d) >= 2:
                 oi_now  = float(oi_d[0].get("oi", 1))
                 oi_prev = float(oi_d[1].get("oi", 1))
@@ -504,7 +522,7 @@ def calc_indicators_4h(df4h: pd.DataFrame) -> pd.DataFrame:
 # BTC MACRO FILTER
 # ===============================================================
 
-def get_btc_4h_change(exchange) -> float:
+def get_btc_4h_change(exchange=None) -> float:
     try:
         data_btc = _fetch_candles("BTC-USDT", "4H", 5)
         ohlcv = [[int(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])] for d in data_btc] if data_btc else []

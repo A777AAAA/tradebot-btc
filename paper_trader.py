@@ -17,7 +17,7 @@ paper_trader.py v8.0 — Partial Take Profit + Улучшенный Trailing
 import json
 import os
 import logging
-import ccxt
+import requests
 from datetime import datetime, timezone
 
 from config import (
@@ -48,7 +48,7 @@ PARTIAL_TP1_MULT         = 1.5   # TP1 = entry + 1.5×ATR (первый выхо
 PARTIAL_TP2_MULT         = 3.0   # TP2 = entry + 3.0×ATR (второй выход 50%)
 PARTIAL_TP_RATIO         = 0.50  # 50% закрываем на TP1
 
-OKX_CONFIG = {'options': {'defaultType': 'spot'}, 'timeout': 30000}
+OKX_REST = 'https://www.okx.com/api/v5'
 
 logger = logging.getLogger(__name__)
 
@@ -149,9 +149,10 @@ def save_trades(trades: list):
 # ─────────────────────────────────────────────
 def get_current_price(symbol: str = "TON/USDT") -> float:
     try:
-        exchange = ccxt.okx(OKX_CONFIG)
-        ticker   = exchange.fetch_ticker(symbol)
-        return float(ticker['last'])
+        inst = symbol.replace("/", "-")
+        r    = requests.get(f"{OKX_REST}/market/ticker?instId={inst}", timeout=10)
+        data = r.json().get("data", [{}])
+        return float(data[0].get("last", 0.0))
     except Exception as e:
         logger.error(f"[Paper] ❌ Ошибка цены: {e}")
         return 0.0

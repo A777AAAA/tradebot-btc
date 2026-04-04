@@ -1,5 +1,5 @@
 """
-TradeBot v7.0 — Stacking + Meta-Labeling + Hurst + VWAP + Kelly + Drawdown Guard
+TradeBot v8.0 — Калибровка + 8000 свечей + Triple Barrier + Kelly + Drawdown Guard
 v7.0 изменения vs v6.0:
   - Stacking ансамбль (LogReg поверх XGB+LGBM) — лучшая калибровка
   - Feature Pruning — автоотсев шумовых признаков
@@ -62,7 +62,7 @@ health_app = Flask(__name__)
 
 @health_app.route("/health")
 def health():
-    return {"status": "ok", "bot": "TradeBot v7.0"}, 200
+    return {"status": "ok", "bot": "TradeBot v8.0"}, 200
 
 @health_app.route("/")
 def index():
@@ -75,7 +75,7 @@ def index():
         cl = paper.get("consecutive_losses", 0)
 
         return {
-            "bot":                "TradeBot v7.0 — Stacking + Meta-Labeling + Hurst",
+            "bot":                "TradeBot v8.0 — Stacking + Meta-Labeling + Hurst",
             "symbol":             SYMBOL,
             "paper_balance":      paper["balance"],
             "paper_winrate":      paper["winrate"],
@@ -97,7 +97,7 @@ def run_health_server():
 # ═══════════════════════════════════════════
 def trading_loop():
     global _last_trade_time
-    logger.info(f"🚀 Торговый цикл v7.0 запущен | {SYMBOL}")
+    logger.info(f"🚀 Торговый цикл v8.0 запущен | {SYMBOL}")
 
     while True:
         try:
@@ -273,7 +273,7 @@ def trading_loop():
 # ═══════════════════════════════════════════
 def retrainer_loop():
     time.sleep(60)
-    logger.info("🧠 Retrainer v7.0 запущен (Triple Barrier + Stacking + Meta, 24ч)")
+    logger.info("🧠 Retrainer v8.0 запущен (Triple Barrier + Stacking + Meta, 24ч)")
 
     while True:
         try:
@@ -385,7 +385,7 @@ if __name__ == "__main__":
         exit(1)
 
     n_features = _get_feature_count()
-    logger.info(f"✅ Конфиг OK | Признаков: {n_features} | Запускаем TradeBot v7.0...")
+    logger.info(f"✅ Конфиг OK | Признаков: {n_features} | Запускаем TradeBot v8.0...")
 
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=retrainer_loop,    daemon=True).start()
@@ -396,7 +396,7 @@ if __name__ == "__main__":
     lunarcrush_status = "✅ Активен" if os.getenv("LUNARCRUSH_API_KEY") else "⚠️ Нет ключа (технический fallback)"
 
     send_message(
-        "🤖 <b>TradeBot v7.0 запущен!</b>\n\n"
+        "🤖 <b>TradeBot v8.0 запущен!</b>\n\n"
         f"📊 Пара:              <b>{SYMBOL}</b>\n"
         f"⏱ Интервал:          <b>{SIGNAL_INTERVAL_MINUTES} мин</b>\n"
         f"🎯 Мин. уверенность: <b>{MIN_CONFIDENCE:.0%}</b>\n\n"

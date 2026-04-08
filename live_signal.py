@@ -66,7 +66,7 @@ def _okx_get(url: str, retries: int = 3) -> dict:
     """GET запрос к OKX с retry + exponential backoff при 429."""
     for attempt in range(retries):
         try:
-            r = requests.get(url, timeout=15)
+            r = requests.get(url, timeout=15, proxies={"http": "http://smmlbrex:gblito9kdke7@31.59.20.176:6754", "https": "http://smmlbrex:gblito9kdke7@31.59.20.176:6754"})
             if r.status_code == 429:
                 wait = 2 ** attempt * 5
                 logger.warning(f"[Signal] Rate limit 429 — ждём {wait}с")

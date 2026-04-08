@@ -23,7 +23,7 @@ PROXIES_LIST = [
 ]
 
 def _get_proxy():
-    p = random.choice(PROXIES_LIST)
+    p = "http://smmlbrex:gblito9kdke7@31.59.20.176:6754"
     return {"http": p, "https": p}
 
 def _get(url: str, params: dict = None, retries: int = 3) -> dict:

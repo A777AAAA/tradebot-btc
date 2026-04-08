@@ -1,2 +1,4 @@
 .env
 *.save
+.env
+*.save

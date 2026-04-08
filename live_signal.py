@@ -270,7 +270,7 @@ def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
 
         oi_change_pct = 0.0
         try:
-            oi_url = f"{OKX_REST}/api/v5/rubric/open-interest-history?instId={inst_id_swap}&period=1H&limit=3"
+            oi_url = f"{OKX_REST}/api/v5/public/open-interest?instId={inst_id_swap}&limit=3"
             oi_d_raw = _okx_get(oi_url)
             oi_d   = oi_d_raw.get("data", [])
             if len(oi_d) >= 2:

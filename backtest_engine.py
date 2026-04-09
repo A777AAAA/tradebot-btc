@@ -42,7 +42,7 @@ def fetch_history(symbol: str = "TON-USDT",
             if after:
                 url += f"&after={after}"
 
-            r    = requests.get(url, timeout=15)
+            r    = requests.get(url, timeout=15, proxies={"http": "http://smmlbrex:gblito9kdke7@31.59.20.176:6754", "https": "http://smmlbrex:gblito9kdke7@31.59.20.176:6754"})
             data = r.json().get("data", [])
             if not data:
                 break

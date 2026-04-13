@@ -1,4 +1,6 @@
 .env
-*.save
-.env
-*.save
+__pycache__/
+*.pyc
+*.pkl
+*.json
+logs/

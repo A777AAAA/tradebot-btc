@@ -15,6 +15,7 @@ paper_trader.py v8.0 — Partial Take Profit + Улучшенный Trailing
 """
 
 import json
+from claude_advisor import add_trade_result
 import os
 import logging
 import requests
@@ -27,6 +28,17 @@ from config import (
     TRAILING_DISTANCE_PCT, BREAKEVEN_ACTIVATION,
     STRONG_SIGNAL,
 )
+
+import importlib
+
+def _get_cfg(param, default):
+    try:
+        import config as _cfg
+        importlib.reload(_cfg)
+        return getattr(_cfg, param, default)
+    except Exception:
+        return default
+
 
 PAPER_FILE   = "paper_trades.json"
 BALANCE_FILE = "paper_balance.json"
@@ -185,12 +197,12 @@ def _calc_sl_tp(signal: str, price: float, atr: float = 0.0) -> dict:
     use_atr = atr > 0
 
     if use_atr:
-        raw_sl_pct = (atr * ATR_SL_MULT) / price
+        raw_sl_pct = (atr * _get_cfg("ATR_SL_MULT", 1.5)) / price
         sl_pct     = max(SL_FLOOR_PCT, min(raw_sl_pct, SL_CAP_PCT))
         tp1_pct    = (atr * PARTIAL_TP1_MULT) / price  # первый выход
         tp2_pct    = (atr * PARTIAL_TP2_MULT) / price  # второй выход
         rr_ratio   = round(tp2_pct / (sl_pct + 1e-9), 2)
-        mode       = f"ATR×SL={ATR_SL_MULT}/TP1={PARTIAL_TP1_MULT}/TP2={PARTIAL_TP2_MULT} R:R≈{rr_ratio}"
+        mode       = f"ATR×SL={_get_cfg('ATR_SL_MULT',1.5)}/TP1={PARTIAL_TP1_MULT}/TP2={PARTIAL_TP2_MULT} R:R≈{rr_ratio}"
     else:
         sl_pct  = STOP_LOSS_PCT
         tp1_pct = TAKE_PROFIT_PCT * 0.5
@@ -559,6 +571,9 @@ def monitor_trades(symbol: str = "TON/USDT") -> list:
             "result":        result,
             "closed_by":     hit,
         })
+        try:
+            add_trade_result(trade.get("signal","?"), trade.get("regime","?"), trade.get("adx",0), trade.get("hurst",0), result, round(pnl_pct,2))
+        except Exception: pass
 
         balance_data["balance"]   = round(balance_data["balance"] + pnl_usd, 2)
         balance_data["total_pnl"] = round(balance_data.get("total_pnl", 0) + pnl_usd, 2)

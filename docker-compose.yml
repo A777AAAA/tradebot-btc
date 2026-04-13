@@ -1,0 +1,36 @@
+# ВАЖНО: после docker build --no-cache запустить переобучение:
+# docker exec -it tradebot_new python3 -c "from auto_trainer import train_model; r=train_model(); print(r.get('status'), r.get('n_features'))"
+# Это обновит модели и model_features.json под текущий набор признаков (55)
+
+version: "3.8"
+
+services:
+  tradebot_new:
+    image: tradebot
+    container_name: tradebot_new
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    volumes:
+      - /root/tradebot_models/model_buy_xgb.pkl:/app/model_buy_xgb.pkl
+      - /root/tradebot_models/model_sell_xgb.pkl:/app/model_sell_xgb.pkl
+      - /root/tradebot_models/model_buy_lgbm.pkl:/app/model_buy_lgbm.pkl
+      - /root/tradebot_models/model_sell_lgbm.pkl:/app/model_sell_lgbm.pkl
+      - /root/tradebot_models/stack_model_buy.pkl:/app/stack_model_buy.pkl
+      - /root/tradebot_models/stack_model_sell.pkl:/app/stack_model_sell.pkl
+      - /root/tradebot_models/meta_model_buy.pkl:/app/meta_model_buy.pkl
+      - /root/tradebot_models/meta_model_sell.pkl:/app/meta_model_sell.pkl
+      - /root/tradebot_models/calibrated_model_buy.pkl:/app/calibrated_model_buy.pkl
+      - /root/tradebot_models/calibrated_model_sell.pkl:/app/calibrated_model_sell.pkl
+      - /root/tradebot_data:/app/data
+      - /root/TradingCons/config.py:/app/config.py
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

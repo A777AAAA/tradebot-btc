@@ -36,6 +36,16 @@ from config import (
     SYMBOL
 )
 
+import importlib
+
+def _get_cfg(param, default):
+    try:
+        import config as _cfg
+        importlib.reload(_cfg)
+        return getattr(_cfg, param, default)
+    except Exception:
+        return default
+
 logger = logging.getLogger(__name__)
 
 OKX_REST = 'https://www.okx.com'
@@ -127,7 +137,7 @@ def load_feature_cols() -> list:
 # v8.0 NEW: РЕАЛЬНЫЙ ORDER BOOK OFI
 # ===============================================================
 
-def get_orderbook_ofi(symbol: str = "TON/USDT", depth: int = 10) -> dict:
+def get_orderbook_ofi(symbol: str = "BTC/USDT", depth: int = 10) -> dict:
     """
     Реальный Order Flow Imbalance из стакана OKX.
 
@@ -247,7 +257,7 @@ def get_orderbook_ofi(symbol: str = "TON/USDT", depth: int = 10) -> dict:
 # ORDER FLOW — Funding Rate + Open Interest
 # ===============================================================
 
-def get_funding_data(symbol_spot: str = "TON/USDT") -> dict:
+def get_funding_data(symbol_spot: str = "BTC/USDT") -> dict:
     global _funding_cache
 
     now = time.time()
@@ -788,7 +798,7 @@ def _apply_ob_ofi_boost(signal: str, confidence: float,
 # ГЛАВНАЯ ФУНКЦИЯ
 # ===============================================================
 
-def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
+def get_live_signal(symbol: str = "BTC/USDT") -> dict | None:
     """
     Полный pipeline v8.0:
       1. Загружаем модели (базовые + calibrated + stack + мета)
@@ -944,8 +954,8 @@ def get_live_signal(symbol: str = "TON/USDT") -> dict | None:
                 filter_log.append(f"PERCENTILE_LOW_{confidence:.1%}")
                 signal = "HOLD"
 
-        if REGIME_FILTER_ENABLED and signal != "HOLD" and adx_1h < REGIME_ADX_THRESHOLD:
-            filter_log.append(f"ADX={adx_1h:.1f}<{REGIME_ADX_THRESHOLD}")
+        if REGIME_FILTER_ENABLED and signal != "HOLD" and adx_1h < _get_cfg("REGIME_ADX_THRESHOLD", 18.0):
+            filter_log.append(f"ADX={adx_1h:.1f}<{_get_cfg('REGIME_ADX_THRESHOLD', 18.0)}")
             signal = "HOLD"
 
         mtf_confirmed = True

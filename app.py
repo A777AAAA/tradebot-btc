@@ -10,6 +10,7 @@ v7.0 изменения vs v6.0:
 """
 
 import threading
+from claude_advisor import run_advisor, add_log
 import time
 import logging
 import os
@@ -22,6 +23,16 @@ from config import (
     MODEL_FEATURES_PATH
 )
 from live_signal        import get_live_signal
+
+import importlib
+def get_config(param, default):
+    try:
+        import config as _cfg
+        importlib.reload(_cfg)
+        return getattr(_cfg, param, default)
+    except Exception:
+        return default
+
 from sentiment_analyzer import get_market_sentiment, sentiment_to_signal_boost
 from telegram_notify    import send_message
 from trade_archive      import get_statistics
@@ -166,9 +177,10 @@ def trading_loop():
                 f"4H={'✅' if mtf_ok else '❌'} | BTC={btc_ch:+.2f}%"
                 + (f" | meta={p_meta:.1%}" if p_meta is not None else "")
             )
+            add_log(f"Signal v8.0] {signal} | p_buy={p_buy:.1%} p_sell={p_sell:.1%} | ADX={adx:.1f} | Hurst={hurst:.3f} | Regime={regime}")
 
             # Открытие сделки
-            if signal in ("BUY", "SELL") and confidence >= MIN_CONFIDENCE:
+            if signal in ("BUY", "SELL") and confidence >= get_config("MIN_CONFIDENCE", 0.52):
                 sent = {}
                 try:
                     sent  = get_market_sentiment(price, change_24h, volume,
@@ -185,8 +197,8 @@ def trading_loop():
                 except Exception:
                     pass
 
-                if confidence >= MIN_CONFIDENCE:
-                    strength_label = "🔥 STRONG" if confidence >= STRONG_SIGNAL else "📶 NORMAL"
+                if confidence >= get_config("MIN_CONFIDENCE", 0.52):
+                    strength_label = "🔥 STRONG" if confidence >= get_config("STRONG_SIGNAL", 0.65) else "📶 NORMAL"
 
                     extra_info = {
                         "p_buy":         p_buy,
@@ -331,7 +343,9 @@ def retrainer_loop():
                     f"🔬 Optuna:      <b>30 trials ✅</b>\n"
                     f"🏗️ Stacking:    <b>{'✅' if result.get('stacking') else '❌'}</b>"
                 )
+                add_log(f"BUY prec={buy_prec:.1%} | sharpe={wf_sharpe_buy:.2f} | Kelly={kelly_f:.1%}")
             else:
+                add_log(f"[Retrainer] Неудача: {result.get('error')}")
                 logger.warning(f"[Retrainer] Неудача: {result.get('error')}")
         except Exception as e:
             logger.error(f"[Retrainer] Ошибка: {e}", exc_info=True)
@@ -375,6 +389,16 @@ def stats_loop():
         time.sleep(24 * 60 * 60)
 
 
+
+def advisor_loop():
+    time.sleep(600)
+    while True:
+        try:
+            run_advisor(symbol=SYMBOL)
+        except Exception as e:
+            logger.error(f"[Advisor] Ошибка: {e}")
+        time.sleep(6 * 60 * 60)
+
 # ═══════════════════════════════════════════
 # ТОЧКА ВХОДА
 # ═══════════════════════════════════════════
@@ -392,6 +416,7 @@ if __name__ == "__main__":
     threading.Thread(target=trading_loop,      daemon=True).start()
     threading.Thread(target=backtest_loop,     daemon=True).start()
     threading.Thread(target=stats_loop,        daemon=True).start()
+    threading.Thread(target=advisor_loop,      daemon=True).start()
 
     lunarcrush_status = "✅ Активен" if os.getenv("LUNARCRUSH_API_KEY") else "⚠️ Нет ключа (технический fallback)"
 

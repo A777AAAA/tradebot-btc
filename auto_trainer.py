@@ -1321,6 +1321,25 @@ def train_model() -> dict:
         "lgbm_model": buy_lgbm,
     }
 
+def _git_push_if_better(stats):
+    try:
+        import subprocess, json, os
+        prec = stats.get("avg_buy_precision", 0)
+        sharpe = stats.get("wf_buy_sharpe", 0)
+        kelly = stats.get("kelly_fraction", 0)
+        msg = f"auto: BUY_prec={prec:.1%} Sharpe={sharpe:.2f} Kelly={kelly:.1%}"
+        repo = "/root/TradingCons"
+        files = ["app.py","live_signal.py","auto_trainer.py","paper_trader.py","claude_advisor.py","config.py"]
+        subprocess.run(["git","-C",repo,"add"] + files, check=True)
+        subprocess.run(["git","-C",repo,"commit","-m",msg], capture_output=True)
+        subprocess.run(["git","-C",repo,"push","tradebot-btc","main"], check=True, capture_output=True)
+        import logging
+        logging.getLogger(__name__).info(f"[Git] ✅ Запушено: {msg}")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[Git] Push пропущен: {e}")
+
+
 
 if __name__ == "__main__":
     logging.basicConfig(

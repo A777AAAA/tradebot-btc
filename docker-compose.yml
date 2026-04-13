@@ -27,6 +27,7 @@ services:
       - /root/tradebot_models/calibrated_model_sell.pkl:/app/calibrated_model_sell.pkl
       - /root/tradebot_data:/app/data
       - /root/TradingCons/config.py:/app/config.py
+      - /root/TradingCons/claude_advisor.py:/app/claude_advisor.py
     env_file:
       - .env
     logging:

@@ -35,7 +35,7 @@ STOP_LOSS_PCT   = 0.015
 TAKE_PROFIT_PCT = 0.030
 
 ATR_SL_MULT  = 1.5
-ATR_TP_MULT  = 3.5
+ATR_TP_MULT  = 2.8
 SL_FLOOR_PCT = 0.008
 SL_CAP_PCT   = 0.040
 
@@ -49,8 +49,8 @@ TRADE_AMOUNT = 10.0
 # ═══════════════════════════════════════════
 # ПОРОГИ СИГНАЛОВ v7.0
 # ═══════════════════════════════════════════
-MIN_CONFIDENCE          = 0.58
-STRONG_SIGNAL           = 0.65
+MIN_CONFIDENCE          = 0.55
+STRONG_SIGNAL           = 0.62
 SIGNAL_INTERVAL_MINUTES = 60
 
 CONFIDENCE_PERCENTILE   = 50
@@ -60,7 +60,7 @@ BTC_FILTER_ENABLED      = True
 BTC_CORRELATION_THRESH  = -0.04
 
 REGIME_FILTER_ENABLED   = True
-REGIME_ADX_THRESHOLD    = 20.0
+REGIME_ADX_THRESHOLD    = 22.0
 
 # ═══════════════════════════════════════════
 # ПЕРЕОБУЧЕНИЕ

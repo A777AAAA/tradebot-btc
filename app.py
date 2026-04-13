@@ -344,6 +344,8 @@ def retrainer_loop():
                     f"🏗️ Stacking:    <b>{'✅' if result.get('stacking') else '❌'}</b>"
                 )
                 add_log(f"BUY prec={buy_prec:.1%} | sharpe={wf_sharpe_buy:.2f} | Kelly={kelly_f:.1%}")
+                from auto_trainer import _git_push_if_better
+                _git_push_if_better(result)
             else:
                 add_log(f"[Retrainer] Неудача: {result.get('error')}")
                 logger.warning(f"[Retrainer] Неудача: {result.get('error')}")

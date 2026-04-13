@@ -30,6 +30,7 @@ _last_regime       = ""
 _last_precision    = 0.0
 _last_errors_count = 0
 _trade_results     = []   # {"signal","regime","adx","hurst","result","pnl"}
+_params_history    = []   # история изменений параметров
 
 # ─────────────────────────────────────────
 # Буфер логов и сделок
@@ -131,6 +132,10 @@ def _build_prompt(metrics, symbol="BTC/USDT"):
     errors   = "\n".join(metrics["errors"]) if metrics["errors"] else "нет"
     trades   = _trade_summary()
 
+    if _params_history:
+        history = "\n".join(f"{h['ts']} | {h['param']}={h['value']}" for h in _params_history[-10:])
+    else:
+        history = "Изменений ещё не было"
     return f"""Ты эксперт по алгоритмической торговле BTC. Анализируй метрики и давай точные рекомендации.
 
 === МЕТРИКИ БОТА {symbol} ===
@@ -145,12 +150,17 @@ WF Sharpe: {metrics['last_sharpe']:.2f} | Kelly: {metrics['last_kelly']:.1f}%
 === РЕЗУЛЬТАТЫ СДЕЛОК ===
 {trades}
 
+=== ИСТОРИЯ ПОСЛЕДНИХ ИЗМЕНЕНИЙ ===
+{history}
+
 === ТЕКУЩИЕ ПАРАМЕТРЫ CONFIG ===
 MIN_CONFIDENCE: {_read_config_param('MIN_CONFIDENCE', 0.52)}
 STRONG_SIGNAL: {_read_config_param('STRONG_SIGNAL', 0.65)}
 REGIME_ADX_THRESHOLD: {_read_config_param('REGIME_ADX_THRESHOLD', 18.0)}
 ATR_SL_MULT: {_read_config_param('ATR_SL_MULT', 1.5)}
 ATR_TP_MULT: {_read_config_param('ATR_TP_MULT', 3.0)}
+
+{_memory_context()}
 
 === ЗАДАЧА ===
 1. Дай 2-3 текстовых вывода что не так и почему
@@ -258,6 +268,7 @@ def _apply_params(params):
             if n > 0:
                 applied.append(f"{name}={value}")
                 logger.info(f"[Advisor] ✅ Применено: {name} = {value}")
+                _params_history.append({"ts": datetime.now().strftime("%d.%m %H:%M"), "param": name, "value": value})
             else:
                 logger.warning(f"[Advisor] Не найдено в config: {name}")
         if applied:
@@ -346,6 +357,15 @@ def run_advisor(symbol="BTC/USDT", force=False):
         f"<i>BUY={metrics['signals_buy']} SELL={metrics['signals_sell']} HOLD={metrics['signals_hold']}</i>"
     )
     logger.info(f"[Advisor] Отправлено в Telegram | Применено: {applied}")
+    _save_memory({
+        "ts": datetime.now().strftime("%d.%m %H:%M"),
+        "ts_unix": time.time(),
+        "trigger": trigger_reason,
+        "regime": metrics["last_regime"],
+        "precision": metrics["last_precision_buy"],
+        "sharpe": metrics["last_sharpe"],
+        "applied": applied,
+    })
     if applied:
         logger.info("[Advisor] Перезапуск контейнера для применения параметров...")
         subprocess.Popen(["sh", "-c", "sleep 5 && docker restart tradebot_new"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -376,3 +396,43 @@ if __name__ == "__main__":
 
     result = run_advisor(force=True)
     print("\n=== РЕКОМЕНДАЦИЯ ===\n", result)
+
+# ─────────────────────────────────────────
+# ПАМЯТЬ — сохранение истории на диск
+# ─────────────────────────────────────────
+MEMORY_FILE = "/app/data/advisor_memory.json"
+MEMORY_DAYS = 3
+
+def _load_memory() -> list:
+    try:
+        with open(MEMORY_FILE) as f:
+            data = json.load(f)
+        cutoff = time.time() - MEMORY_DAYS * 86400
+        return [r for r in data if r.get("ts_unix", 0) > cutoff]
+    except Exception:
+        return []
+
+def _save_memory(record: dict):
+    try:
+        import os
+        os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
+        history = _load_memory()
+        history.append(record)
+        history = history[-50:]
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"[Memory] Ошибка сохранения: {e}")
+
+def _memory_context() -> str:
+    history = _load_memory()
+    if not history:
+        return "История решений: пусто (первый запуск)"
+    lines = ["=== ИСТОРИЯ РЕШЕНИЙ (последние 3 дня) ==="]
+    for r in history[-5:]:
+        lines.append(
+            f"[{r.get('ts','')}] Триггер: {r.get('trigger','')} | "
+            f"Применено: {r.get('applied',[])} | "
+            f"Режим: {r.get('regime','')} | Precision: {r.get('precision',0):.1f}%"
+        )
+    return "\n".join(lines)

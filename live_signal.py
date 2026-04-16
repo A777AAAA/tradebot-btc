@@ -56,6 +56,7 @@ STACK_MODEL_BUY_PATH  = "stack_model_buy.pkl"
 STACK_MODEL_SELL_PATH = "stack_model_sell.pkl"
 CALIB_MODEL_BUY_PATH  = "calibrated_model_buy.pkl"   # v8.0
 CALIB_MODEL_SELL_PATH = "calibrated_model_sell.pkl"   # v8.0
+HOLD_MODEL_BUY_PATH   = "stack_model_buy.pkl"   # переиспользуем stack для HOLD-score
 
 _confidence_history: list = []
 _HISTORY_MAX = 48
@@ -895,6 +896,11 @@ def get_live_signal(symbol: str = "BTC/USDT") -> dict | None:
             "STACK" if has_stack and not has_calib else "",
         ]))
 
+        # 4.8 HOLD вероятность: 1 - max(p_buy, p_sell) с поправкой
+        # Если обе вероятности низкие — высокая вероятность боковика
+        p_hold = round(float(1.0 - min(p_buy + p_sell, 1.0)), 4)
+        p_hold = max(p_hold, 0.0)
+
         # 5. v8.0 Regime-Switching: адаптивный порог
         adx_1h    = float(last_1h.get('ADX',       25.0))
         atr_ratio = float(last_1h.get('ATR_ratio',  1.0))
@@ -1027,6 +1033,7 @@ def get_live_signal(symbol: str = "BTC/USDT") -> dict | None:
             "p_sell_lgbm":   round(p_sell_lgbm, 4),
             "p_buy_cal":     round(p_buy_cal,   4),  # v8.0
             "p_sell_cal":    round(p_sell_cal,  4),  # v8.0
+            "p_hold":        round(p_hold,      4),  # v8.3 HOLD вероятность
 
             # Layer 2: мета-модель
             "p_meta":        round(p_meta, 4) if p_meta is not None else None,

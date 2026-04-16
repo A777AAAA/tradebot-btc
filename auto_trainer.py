@@ -438,6 +438,13 @@ def triple_barrier_labels(df: pd.DataFrame,
     df = df.copy()
     df['Target_BUY']  = target_buy
     df['Target_SELL'] = target_sell
+    # HOLD: цена не вышла ни за TP ни за SL — боковик
+    target_hold = np.where(
+        np.isnan(target_buy) & np.isnan(target_sell), 1,
+        np.where((target_buy == 0) & (target_sell == 0), 1, 0)
+    ).astype(float)
+    target_hold[n - horizon:] = np.nan
+    df['Target_HOLD'] = target_hold
 
     total     = n - horizon
     buy_valid = int(np.sum(~np.isnan(target_buy[:total])))

@@ -644,6 +644,37 @@ def train_binary_lgbm(X_train, y_train, X_test, y_test) -> tuple:
     }
     return model, metrics
 
+# v8.1: CatBoost base learner
+def train_binary_cat(X_train, y_train, X_test, y_test) -> tuple:
+    if not CATBOOST_AVAILABLE:
+        return None, None
+    pos_count = y_train.sum()
+    neg_count = len(y_train) - pos_count
+    scale_pos = neg_count / (pos_count + 1e-9)
+    model = CatBoostClassifier(
+        iterations=400, depth=4, learning_rate=0.03,
+        l2_leaf_reg=3.0, subsample=0.75,
+        scale_pos_weight=min(scale_pos, 5.0),
+        eval_metric="AUC", verbose=0,
+        early_stopping_rounds=50,
+    )
+    model.fit(
+        X_train, y_train,
+        eval_set=(X_test, y_test),
+        use_best_model=True,
+    )
+    y_pred  = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    metrics = {
+        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+        "recall":    float(recall_score(y_test, y_pred, zero_division=0)),
+        "f1":        float(f1_score(y_test, y_pred, zero_division=0)),
+        "accuracy":  float(accuracy_score(y_test, y_pred)),
+        "roc_auc":   float(roc_auc_score(y_test, y_proba)) if y_test.sum() > 0 else 0.0,
+    }
+    return model, metrics
+
+
 
 # ─────────────────────────────────────────────
 # v8.0 NEW: КАЛИБРОВКА ВЕРОЯТНОСТЕЙ
@@ -1130,6 +1161,10 @@ def train_model() -> dict:
 
     logger.info("[Trainer] 🔧 LightGBM BUY...")
     buy_lgbm, buy_lgbm_m = train_binary_lgbm(X_buy_sm, y_buy_sm, X_buy_test, y_buy_test)
+    logger.info("[Trainer] 🔧 CatBoost BUY...")
+    buy_cat, buy_cat_m = train_binary_cat(X_buy_sm, y_buy_sm, X_buy_test, y_buy_test)
+    if buy_cat_m:
+        logger.info(f"[Trainer] BUY CAT: prec={buy_cat_m['precision']:.1%} auc={buy_cat_m['roc_auc']:.3f}")
     if buy_lgbm_m:
         logger.info(f"[Trainer] BUY LGBM: prec={buy_lgbm_m['precision']:.1%} auc={buy_lgbm_m['roc_auc']:.3f}")
 
@@ -1139,6 +1174,10 @@ def train_model() -> dict:
 
     logger.info("[Trainer] 🔧 LightGBM SELL...")
     sell_lgbm, sell_lgbm_m = train_binary_lgbm(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test)
+    logger.info("[Trainer] 🔧 CatBoost SELL...")
+    sell_cat, sell_cat_m = train_binary_cat(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test)
+    if sell_cat_m:
+        logger.info(f"[Trainer] SELL CAT: prec={sell_cat_m['precision']:.1%} auc={sell_cat_m['roc_auc']:.3f}")
 
     # 11. FEATURE PRUNING
     logger.info("[Trainer] ✂️ Feature Importance Pruning...")
@@ -1173,12 +1212,12 @@ def train_model() -> dict:
     # 12. STACKING
     logger.info("[Trainer] 🏗️ Stacking BUY...")
     stack_buy, stack_buy_m = train_stacking_ensemble(
-        buy_xgb, buy_lgbm, X_buy_train, y_buy_train, X_buy_test, y_buy_test, "BUY"
+        buy_xgb, buy_lgbm, X_buy_train, y_buy_train, X_buy_test, y_buy_test, "BUY", model_cat=buy_cat
     )
 
     logger.info("[Trainer] 🏗️ Stacking SELL...")
     stack_sell, stack_sell_m = train_stacking_ensemble(
-        sell_xgb, sell_lgbm, X_sell_train, y_sell_train, X_sell_test, y_sell_test, "SELL"
+        sell_xgb, sell_lgbm, X_sell_train, y_sell_train, X_sell_test, y_sell_test, "SELL", model_cat=sell_cat
     )
 
     # 13. META-LABELING

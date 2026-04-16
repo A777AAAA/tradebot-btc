@@ -30,6 +30,12 @@ import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from xgboost import XGBClassifier
+try:
+    from catboost import CatBoostClassifier
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
+from sklearn.linear_model import RidgeClassifierCV
 from sklearn.metrics import (
     accuracy_score, precision_score,
     recall_score, f1_score, roc_auc_score,
@@ -719,11 +725,12 @@ def train_stacking_ensemble(
     model_xgb, model_lgbm,
     X_train: np.ndarray, y_train: np.ndarray,
     X_test: np.ndarray, y_test: np.ndarray,
-    label: str = "BUY"
+    label: str = "BUY",
+    model_cat=None
 ) -> tuple:
     """
-    Stacking: XGB + LGBM → LogisticRegression (meta-learner).
-    v8.0: meta-learner тоже калиброван.
+    Stacking: XGB + LGBM + CatBoost → RidgeCV (meta-learner).
+    v8.1: CatBoost как 3-й base learner + RidgeCV meta.
     """
     if not LGBM_AVAILABLE or model_lgbm is None:
         return None, None
@@ -732,17 +739,19 @@ def train_stacking_ensemble(
         p_xgb  = model_xgb.predict_proba(X_test)[:, 1].reshape(-1, 1)
         p_lgbm = model_lgbm.predict_proba(X_test)[:, 1].reshape(-1, 1)
 
-        p_avg  = ((p_xgb + p_lgbm) / 2)
+        p_cat  = model_cat.predict_proba(X_test)[:, 1].reshape(-1, 1) if (CATBOOST_AVAILABLE and model_cat is not None) else p_xgb
+        p_avg  = ((p_xgb + p_lgbm + p_cat) / 3)
         p_diff = (p_xgb - p_lgbm)
-        X_stack_test = np.hstack([p_xgb, p_lgbm, p_avg, p_diff])
+        X_stack_test = np.hstack([p_xgb, p_lgbm, p_cat, p_avg, p_diff])
 
         from sklearn.model_selection import StratifiedKFold
         n_splits = 5
         skf = StratifiedKFold(n_splits=n_splits, shuffle=False)
 
         p_xgb_oof  = np.zeros(len(X_train))
+        p_xgb_oof  = np.zeros(len(X_train))
         p_lgbm_oof = np.zeros(len(X_train))
-
+        p_cat_oof  = np.zeros(len(X_train))
         for fold, (tr_idx, val_idx) in enumerate(skf.split(X_train, y_train)):
             X_tr, X_val = X_train[tr_idx], X_train[val_idx]
             y_tr, y_val_fold = y_train[tr_idx], y_train[val_idx]
@@ -764,22 +773,30 @@ def train_stacking_ensemble(
                 )
                 lgbm_fold.fit(X_tr, y_tr)
                 p_lgbm_oof[val_idx] = lgbm_fold.predict_proba(X_val)[:, 1]
+            if CATBOOST_AVAILABLE:
+                cat_fold = CatBoostClassifier(
+                    iterations=200, depth=4, learning_rate=0.05,
+                    verbose=0, random_seed=42
+                )
+                cat_fold.fit(X_tr, y_tr)
+                p_cat_oof[val_idx] = cat_fold.predict_proba(X_val)[:, 1]
 
-        p_avg_oof  = (p_xgb_oof + p_lgbm_oof) / 2
+        p_avg_oof  = (p_xgb_oof + p_lgbm_oof + p_cat_oof) / 3
         p_diff_oof = p_xgb_oof - p_lgbm_oof
         X_stack_train = np.column_stack([
-            p_xgb_oof, p_lgbm_oof, p_avg_oof, p_diff_oof
+            p_xgb_oof, p_lgbm_oof, p_cat_oof, p_avg_oof, p_diff_oof
         ])
 
         scaler   = StandardScaler()
         X_st_tr  = scaler.fit_transform(X_stack_train)
         X_st_te  = scaler.transform(X_stack_test)
 
-        stack_model = LogisticRegression(C=1.0, max_iter=500, random_state=42)
+        stack_model = RidgeClassifierCV(alphas=[0.01, 0.1, 1.0, 10.0], cv=5)
         stack_model.fit(X_st_tr, y_train)
 
         y_pred  = stack_model.predict(X_st_te)
-        y_proba = stack_model.predict_proba(X_st_te)[:, 1]
+        d = stack_model.decision_function(X_st_te)
+        y_proba = 1 / (1 + np.exp(-d))
         metrics = {
             'precision': float(precision_score(y_test, y_pred, zero_division=0)),
             'recall':    float(recall_score(y_test, y_pred, zero_division=0)),

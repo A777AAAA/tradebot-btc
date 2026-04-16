@@ -138,6 +138,17 @@ def trading_loop():
                     f"🔒 Причина: <b>{trade.get('closed_by','—')}</b>"
                     f"{trailing_note}{cl_note}"
                 )
+                try:
+                    from claude_advisor import add_trade_result
+                    add_trade_result(
+                        signal=trade.get('signal','?'),
+                        regime=trade.get('regime','?'),
+                        adx=float(trade.get('adx',0)),
+                        hurst=float(trade.get('hurst',0.5)),
+                        result=trade['result'],
+                        pnl=float(trade.get('pnl_pct',0))
+                    )
+                except Exception: pass
 
             # Cooldown
             since_last = time.time() - _last_trade_time

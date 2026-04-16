@@ -49,18 +49,18 @@ TRADE_AMOUNT = 10.0
 # ═══════════════════════════════════════════
 # ПОРОГИ СИГНАЛОВ v7.0
 # ═══════════════════════════════════════════
-MIN_CONFIDENCE          = 0.55
+MIN_CONFIDENCE          = 0.60
 STRONG_SIGNAL           = 0.62
 SIGNAL_INTERVAL_MINUTES = 60
 
-CONFIDENCE_PERCENTILE   = 50
+CONFIDENCE_PERCENTILE   = 25
 
 MTF_ENABLED             = True
 BTC_FILTER_ENABLED      = True
 BTC_CORRELATION_THRESH  = -0.04
 
 REGIME_FILTER_ENABLED   = True
-REGIME_ADX_THRESHOLD    = 22.0
+REGIME_ADX_THRESHOLD    = 14.0
 
 # ═══════════════════════════════════════════
 # ПЕРЕОБУЧЕНИЕ

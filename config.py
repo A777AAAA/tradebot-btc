@@ -65,9 +65,9 @@ REGIME_ADX_THRESHOLD    = 14.0
 # ═══════════════════════════════════════════
 # ПЕРЕОБУЧЕНИЕ
 # ═══════════════════════════════════════════
-RETRAIN_DAY          = os.getenv("RETRAIN_DAY",  "sunday")
+RETRAIN_DAY          = os.getenv("RETRAIN_DAY",  "")
 RETRAIN_HOUR         = int(os.getenv("RETRAIN_HOUR", "2"))
-RETRAIN_INTERVAL_HRS = 24
+RETRAIN_INTERVAL_HRS = 6
 MIN_NEW_SAMPLES      = 50
 
 WF_TRAIN_DAYS = 90

@@ -1,9 +1,4 @@
-# ВАЖНО: после docker build --no-cache запустить переобучение:
-# docker exec -it tradebot_new python3 -c "from auto_trainer import train_model; r=train_model(); print(r.get('status'), r.get('n_features'))"
-# Это обновит модели и model_features.json под текущий набор признаков (55)
-
 version: "3.8"
-
 services:
   tradebot_new:
     image: tradebot
@@ -15,19 +10,9 @@ services:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:
-      - /root/tradebot_models/model_buy_xgb.pkl:/app/model_buy_xgb.pkl
-      - /root/tradebot_models/model_sell_xgb.pkl:/app/model_sell_xgb.pkl
-      - /root/tradebot_models/model_buy_lgbm.pkl:/app/model_buy_lgbm.pkl
-      - /root/tradebot_models/model_sell_lgbm.pkl:/app/model_sell_lgbm.pkl
-      - /root/tradebot_models/stack_model_buy.pkl:/app/stack_model_buy.pkl
-      - /root/tradebot_models/stack_model_sell.pkl:/app/stack_model_sell.pkl
-      - /root/tradebot_models/meta_model_buy.pkl:/app/meta_model_buy.pkl
-      - /root/tradebot_models/meta_model_sell.pkl:/app/meta_model_sell.pkl
-      - /root/tradebot_models/calibrated_model_buy.pkl:/app/calibrated_model_buy.pkl
-      - /root/tradebot_models/calibrated_model_sell.pkl:/app/calibrated_model_sell.pkl
-      - /root/tradebot_data:/app/data
       - /root/TradingCons/config.py:/app/config.py
-      - /root/TradingCons/claude_advisor.py:/app/claude_advisor.py
+      - /root/tradebot_data:/app/data
+      - btc_models:/app/models
     env_file:
       - .env
     logging:
@@ -35,3 +20,6 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+
+volumes:
+  btc_models:

@@ -49,8 +49,8 @@ TRADE_AMOUNT = 10.0
 # ═══════════════════════════════════════════
 # ПОРОГИ СИГНАЛОВ v7.0
 # ═══════════════════════════════════════════
-MIN_CONFIDENCE          = 0.60
-STRONG_SIGNAL           = 0.62
+MIN_CONFIDENCE          = 0.55
+STRONG_SIGNAL           = 0.63
 SIGNAL_INTERVAL_MINUTES = 60
 
 CONFIDENCE_PERCENTILE   = 25
@@ -60,7 +60,7 @@ BTC_FILTER_ENABLED      = True
 BTC_CORRELATION_THRESH  = -0.04
 
 REGIME_FILTER_ENABLED   = True
-REGIME_ADX_THRESHOLD    = 14.0
+REGIME_ADX_THRESHOLD    = 15.0
 
 # ═══════════════════════════════════════════
 # ПЕРЕОБУЧЕНИЕ
@@ -77,21 +77,21 @@ WF_STEP_DAYS  = 7
 # ═══════════════════════════════════════════
 # ML / МОДЕЛИ v7.0
 # ═══════════════════════════════════════════
-MODEL_PATH_BUY_XGB   = "model_buy_xgb.pkl"
-MODEL_PATH_BUY_LGBM  = "model_buy_lgbm.pkl"
-MODEL_PATH_SELL_XGB  = "model_sell_xgb.pkl"
-MODEL_PATH_SELL_LGBM = "model_sell_lgbm.pkl"
+MODEL_PATH_BUY_XGB   = "models/model_buy_xgb.pkl"
+MODEL_PATH_BUY_LGBM  = "models/model_buy_lgbm.pkl"
+MODEL_PATH_SELL_XGB  = "models/model_sell_xgb.pkl"
+MODEL_PATH_SELL_LGBM = "models/model_sell_lgbm.pkl"
 MODEL_FEATURES_PATH  = "data/model_features.json"
 STATS_FILE           = "training_stats.json"
 
 # Новые модели v7.0
-STACK_MODEL_BUY_PATH  = "stack_model_buy.pkl"
-STACK_MODEL_SELL_PATH = "stack_model_sell.pkl"
+STACK_MODEL_BUY_PATH  = "models/stack_model_buy.pkl"
+STACK_MODEL_SELL_PATH = "models/stack_model_sell.pkl"
 FEATURE_IMPORTANCE_PATH = "feature_importance.json"
 
 # Обратная совместимость
-MODEL_PATH      = "model_buy_xgb.pkl"
-MODEL_PATH_LGBM = "model_buy_lgbm.pkl"
+MODEL_PATH      = "models/model_buy_xgb.pkl"
+MODEL_PATH_LGBM = "models/model_buy_lgbm.pkl"
 
 # ── Фичи 1H (оригинальные) ───────────────
 FEATURE_COLS_1H = [

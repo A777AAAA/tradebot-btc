@@ -1,12 +1,8 @@
 """
-TradeBot v8.0 — Калибровка + 8000 свечей + Triple Barrier + Kelly + Drawdown Guard
-v7.0 изменения vs v6.0:
-  - Stacking ансамбль (LogReg поверх XGB+LGBM) — лучшая калибровка
-  - Feature Pruning — автоотсев шумовых признаков
-  - Hurst Exponent, VWAP Deviation, Realized Volatility, Order Flow Imbalance
-  - Meta-labeling: OOF (исправлен data leakage)
-  - Kelly Criterion + Consecutive Loss Penalty + Drawdown Guard (paper_trader v5.1)
-  - Версия синхронизирована с live_signal, auto_trainer, paper_trader
+TradeBot v8.3 — BTC
+Фиксы vs v8.0:
+  - retrainer_loop читает RETRAIN_INTERVAL_HRS из config (был жёсткий 24ч)
+  - signal_logger: paper trading лог каждого сигнала + авто-проверка через 6ч
 """
 
 import threading
@@ -43,6 +39,15 @@ from paper_trader       import (
 )
 from backtest_engine    import run_backtest, format_backtest_message
 
+try:
+    from signal_logger import (
+        log_signal, check_outcomes,
+        format_outcome_message, get_stats_message, daily_report_message
+    )
+    SIGNAL_LOGGER_OK = True
+except ImportError:
+    SIGNAL_LOGGER_OK = False
+
 logging.basicConfig(
     level  = logging.INFO,
     format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
@@ -56,14 +61,13 @@ TRADE_COOLDOWN_SECONDS = 2 * 60 * 60
 
 
 def _get_feature_count() -> int:
-    """Динамически читает количество фичей из model_features.json."""
     try:
         if os.path.exists(MODEL_FEATURES_PATH):
             with open(MODEL_FEATURES_PATH) as f:
                 return len(json.load(f))
     except Exception:
         pass
-    return 55  # примерное значение для v7.0
+    return 55
 
 
 # ═══════════════════════════════════════════
@@ -73,20 +77,17 @@ health_app = Flask(__name__)
 
 @health_app.route("/health")
 def health():
-    return {"status": "ok", "bot": "TradeBot v8.0"}, 200
+    return {"status": "ok", "bot": "TradeBot v8.3"}, 200
 
 @health_app.route("/")
 def index():
     try:
         stats = get_statistics()
         paper = get_stats()
-
-        # Drawdown warning
         dd = paper.get("current_drawdown", 0)
         cl = paper.get("consecutive_losses", 0)
-
         return {
-            "bot":                "TradeBot v8.0 — Stacking + Meta-Labeling + Hurst",
+            "bot":                "TradeBot v8.3 BTC — signal_logger + retrain 6h",
             "symbol":             SYMBOL,
             "paper_balance":      paper["balance"],
             "paper_winrate":      paper["winrate"],
@@ -104,15 +105,41 @@ def run_health_server():
 
 
 # ═══════════════════════════════════════════
+# ПРОВЕРКА ИСХОДОВ СИГНАЛОВ (signal_logger)
+# ═══════════════════════════════════════════
+def _get_btc_price(symbol: str) -> float:
+    try:
+        sig = get_live_signal()
+        return sig.get("price", 0.0) if sig else 0.0
+    except Exception:
+        return 0.0
+
+
+def outcome_checker_loop():
+    """Каждые 30 минут проверяет результаты сигналов из signal_logger."""
+    if not SIGNAL_LOGGER_OK:
+        return
+    time.sleep(300)
+    while True:
+        try:
+            results = check_outcomes(_get_btc_price)
+            for r in results:
+                send_message(format_outcome_message(r))
+                logger.info(f"[SignalLogger] {r['signal']} {r['outcome']} P&L={r['pnl_pct']:+.2f}%")
+        except Exception as e:
+            logger.error(f"[OutcomeChecker] {e}")
+        time.sleep(30 * 60)
+
+
+# ═══════════════════════════════════════════
 # ТОРГОВЫЙ ЦИКЛ
 # ═══════════════════════════════════════════
 def trading_loop():
     global _last_trade_time
-    logger.info(f"🚀 Торговый цикл v8.0 запущен | {SYMBOL}")
+    logger.info(f"🚀 Торговый цикл v8.3 запущен | {SYMBOL}")
 
     while True:
         try:
-            # Мониторинг открытых сделок
             closed = monitor_trades(PAPER_SYMBOL)
             for trade in closed:
                 _last_trade_time = time.time()
@@ -122,24 +149,32 @@ def trading_loop():
                     trailing_note = "\n🔄 <b>Trailing Stop сработал!</b>"
                 if trade.get("breakeven_hit"):
                     trailing_note += "\n🎯 <b>Breakeven был активен</b>"
-
                 cl_note = ""
                 cl = trade.get("consecutive_loss_at_open", 0)
                 if cl >= 2:
                     cl_note = f"\n⚠️ <b>Kelly снижен (серия убытков: {cl})</b>"
-
                 send_message(
                     f"{emoji} <b>Сделка закрыта — {trade['result']}</b>\n\n"
                     f"📊 {trade['signal']} {trade['symbol']}\n"
                     f"🔵 Вход:  <b>${trade['price_open']:.4f}</b>\n"
                     f"🔴 Выход: <b>${trade['price_close']:.4f}</b>\n"
-                    f"💰 P&L:   <b>{trade['pnl_pct']:+.2f}% "
-                    f"(${trade['pnl_usd']:+.2f})</b>\n"
+                    f"💰 P&L:   <b>{trade['pnl_pct']:+.2f}% (${trade['pnl_usd']:+.2f})</b>\n"
                     f"🔒 Причина: <b>{trade.get('closed_by','—')}</b>"
                     f"{trailing_note}{cl_note}"
                 )
+                try:
+                    from claude_advisor import add_trade_result
+                    add_trade_result(
+                        signal=trade.get('signal','?'),
+                        regime=trade.get('regime','?'),
+                        adx=float(trade.get('adx',0)),
+                        hurst=float(trade.get('hurst',0.5)),
+                        result=trade['result'],
+                        pnl=float(trade.get('pnl_pct',0))
+                    )
+                except Exception:
+                    pass
 
-            # Cooldown
             since_last = time.time() - _last_trade_time
             if since_last < TRADE_COOLDOWN_SECONDS and _last_trade_time > 0:
                 remaining = int((TRADE_COOLDOWN_SECONDS - since_last) / 60)
@@ -147,7 +182,6 @@ def trading_loop():
                 time.sleep(SIGNAL_INTERVAL_MINUTES * 60)
                 continue
 
-            # Сигнал
             signal_data = get_live_signal()
             if not signal_data:
                 logger.warning("⚠️ Сигнал не получен")
@@ -177,65 +211,40 @@ def trading_loop():
                 f"4H={'✅' if mtf_ok else '❌'} | BTC={btc_ch:+.2f}%"
                 + (f" | meta={p_meta:.1%}" if p_meta is not None else "")
             )
-            add_log(f"Signal v8.0] {signal} | p_buy={p_buy:.1%} p_sell={p_sell:.1%} | ADX={adx:.1f} | Hurst={hurst:.3f} | Regime={regime}")
+            add_log(f"[Signal v8.3] {signal} | p_buy={p_buy:.1%} p_sell={p_sell:.1%} | ADX={adx:.1f} | Hurst={hurst:.3f}")
 
-            # Открытие сделки
+            # ── Логируем сигнал в paper trading БД ──
+            if signal in ("BUY", "SELL") and SIGNAL_LOGGER_OK:
+                log_signal(signal, price, SYMBOL, confidence, {
+                    "p_buy": p_buy, "p_sell": p_sell, "models_used": models
+                })
+
             if signal in ("BUY", "SELL") and confidence >= get_config("MIN_CONFIDENCE", 0.52):
                 sent = {}
                 try:
-                    sent  = get_market_sentiment(price, change_24h, volume,
-                                                  rsi=rsi, symbol="TON")
+                    sent  = get_market_sentiment(price, change_24h, volume, rsi=rsi, symbol="BTC")
                     boost = sentiment_to_signal_boost(sent, signal)
                     old_conf = confidence
                     confidence = min(confidence * boost, 0.99)
-                    logger.info(
-                        f"🧠 Sentiment: {sent.get('sentiment')} "
-                        f"src={sent.get('source','?')} "
-                        f"boost={boost:.2f} "
-                        f"conf: {old_conf:.1%}→{confidence:.1%}"
-                    )
+                    logger.info(f"🧠 Sentiment: {sent.get('sentiment')} boost={boost:.2f} conf: {old_conf:.1%}→{confidence:.1%}")
                 except Exception:
                     pass
 
                 if confidence >= get_config("MIN_CONFIDENCE", 0.52):
                     strength_label = "🔥 STRONG" if confidence >= get_config("STRONG_SIGNAL", 0.65) else "📶 NORMAL"
-
                     extra_info = {
-                        "p_buy":         p_buy,
-                        "p_sell":        p_sell,
-                        "models_used":   models,
-                        "mtf_confirmed": mtf_ok,
-                        "btc_change_4h": btc_ch,
-                        "adx":           adx,
-                        "hurst":         hurst,
-                        "regime":        regime,
+                        "p_buy": p_buy, "p_sell": p_sell, "models_used": models,
+                        "mtf_confirmed": mtf_ok, "btc_change_4h": btc_ch,
+                        "adx": adx, "hurst": hurst, "regime": regime,
                     }
-
-                    trade = open_trade(
-                        signal, price, confidence,
-                        PAPER_SYMBOL, atr=atr,
-                        extra_info=extra_info
-                    )
+                    trade = open_trade(signal, price, confidence, PAPER_SYMBOL, atr=atr, extra_info=extra_info)
 
                     if trade:
                         _last_trade_time = time.time()
                         emoji = "🟢" if signal == "BUY" else "🔴"
-
-                        meta_line = ""
-                        if p_meta is not None:
-                            meta_line = f"\n🧩 Meta-filter:   <b>{p_meta:.1%}</b>"
-
-                        sent_line = ""
-                        if sent:
-                            sent_line = (
-                                f"\n🌐 Sentiment:     <b>{sent.get('sentiment','?')} "
-                                f"({sent.get('source','?')})</b>"
-                            )
-
-                        # v7.0: Hurst-режим в сообщение
+                        meta_line = f"\n🧩 Meta-filter:   <b>{p_meta:.1%}</b>" if p_meta is not None else ""
+                        sent_line = (f"\n🌐 Sentiment:     <b>{sent.get('sentiment','?')} ({sent.get('source','?')})</b>") if sent else ""
                         hurst_label = "Тренд" if hurst > 0.6 else ("Mean-Rev" if hurst < 0.4 else "Случайный")
-
-                        # Kelly + drawdown info из баланса
                         paper_stats = get_stats()
                         cl    = paper_stats.get("consecutive_losses", 0)
                         dd    = paper_stats.get("current_drawdown", 0)
@@ -257,17 +266,15 @@ def trading_loop():
                             f"📊 BTC 4H:        <b>{btc_ch:+.2f}%</b>"
                             f"{sent_line}"
                             f"\n💼 Размер:        <b>${trade['amount_usd']:.2f} ({trade['kelly_pct']:.1%})</b>\n"
-                            f"🛑 SL: <b>${trade['sl']:.4f}</b> | "
-                            f"✅ TP: <b>${trade['tp']:.4f}</b>\n"
+                            f"🛑 SL: <b>${trade['sl']:.4f}</b> | ✅ TP: <b>${trade['tp']:.4f}</b>\n"
                             f"🔄 Trailing SL:   <b>{'Активен' if trade.get('trailing_active') else 'Ожидание +1%'}</b>"
                             f"{cl_note}{dd_note}"
                         )
                     else:
-                        # Если не открылась — узнаём почему
                         paper_stats = get_stats()
                         dd = paper_stats.get("current_drawdown", 0)
                         if dd >= 20:
-                            logger.warning(f"[Trading] 🚫 DrawDown Guard: {dd:.1f}% — сделка заблокирована")
+                            logger.warning(f"[Trading] 🚫 DrawDown Guard: {dd:.1f}%")
                         else:
                             logger.info("ℹ️ Сделка не открыта (уже есть открытая)")
             else:
@@ -281,11 +288,12 @@ def trading_loop():
 
 
 # ═══════════════════════════════════════════
-# ПЕРЕОБУЧЕНИЕ (24ч)
+# ПЕРЕОБУЧЕНИЕ — ЧИТАЕТ RETRAIN_INTERVAL_HRS
 # ═══════════════════════════════════════════
 def retrainer_loop():
     time.sleep(60)
-    logger.info("🧠 Retrainer v8.0 запущен (Triple Barrier + Stacking + Meta, 24ч)")
+    interval_hrs = get_config("RETRAIN_INTERVAL_HRS", 6)
+    logger.info(f"🧠 Retrainer v8.3 запущен | интервал: {interval_hrs}ч")
 
     while True:
         try:
@@ -309,69 +317,53 @@ def retrainer_loop():
                 meta_line = ""
                 if meta_buy_p is not None:
                     meta_line = (
-                        f"\n\n🧩 Meta-filter:\n"
-                        f"   BUY:  <b>{meta_buy_p:.1%}</b>\n"
-                        f"   SELL: <b>{meta_sell_p:.1%}</b>"
+                        f"\n\n🧩 Meta-filter:\n   BUY:  <b>{meta_buy_p:.1%}</b>\n   SELL: <b>{meta_sell_p:.1%}</b>"
                         if meta_sell_p else
                         f"\n\n🧩 Meta BUY: <b>{meta_buy_p:.1%}</b>"
                     )
-
-                stack_line = ""
-                if stack_buy_p is not None:
-                    stack_line = f"\n🏗️ Stack BUY prec: <b>{stack_buy_p:.1%}</b>"
+                stack_line = f"\n🏗️ Stack BUY prec: <b>{stack_buy_p:.1%}</b>" if stack_buy_p else ""
 
                 send_message(
-                    f"🧠 <b>Ансамбль v7.0 переобучен!</b>\n\n"
+                    f"🧠 <b>Ансамбль v8.3 переобучен!</b>\n\n"
                     f"🏷 Разметка: <b>{'Triple Barrier ✅' if labeling == 'triple_barrier' else 'Simple'}</b>\n\n"
-                    f"🟢 BUY-модель:\n"
-                    f"   Precision: <b>{buy_prec:.1%}</b>\n"
-                    f"   ROC-AUC:   <b>{buy_auc:.3f}</b>\n"
-                    f"   WF prec:   <b>{wf_buy:.1%}</b>\n"
-                    f"   WF Sharpe: <b>{wf_sharpe_buy:.2f}</b>\n\n"
-                    f"🔴 SELL-модель:\n"
-                    f"   Precision: <b>{sell_prec:.1%}</b>\n"
-                    f"   ROC-AUC:   <b>{sell_auc:.3f}</b>\n"
-                    f"   WF prec:   <b>{wf_sell:.1%}</b>\n"
-                    f"   WF Sharpe: <b>{wf_sharpe_sell:.2f}</b>"
-                    f"{stack_line}"
-                    f"{meta_line}\n\n"
-                    f"📐 Kelly (Half): <b>{kelly_f:.1%}</b>\n"
-                    f"📚 BUY выборка:  <b>{result.get('n_samples_buy','?')}</b>\n"
-                    f"📚 SELL выборка: <b>{result.get('n_samples_sell','?')}</b>\n"
-                    f"🔢 Признаков:    <b>{n_features}</b>\n"
-                    f"⚗️ SMOTE:       <b>{'✅' if result.get('smote_available') else '❌'}</b>\n"
-                    f"🔬 Optuna:      <b>30 trials ✅</b>\n"
-                    f"🏗️ Stacking:    <b>{'✅' if result.get('stacking') else '❌'}</b>"
+                    f"🟢 BUY:\n   Precision: <b>{buy_prec:.1%}</b> | AUC: <b>{buy_auc:.3f}</b>\n"
+                    f"   WF prec: <b>{wf_buy:.1%}</b> | WF Sharpe: <b>{wf_sharpe_buy:.2f}</b>\n\n"
+                    f"🔴 SELL:\n   Precision: <b>{sell_prec:.1%}</b> | AUC: <b>{sell_auc:.3f}</b>\n"
+                    f"   WF prec: <b>{wf_sell:.1%}</b> | WF Sharpe: <b>{wf_sharpe_sell:.2f}</b>"
+                    f"{stack_line}{meta_line}\n\n"
+                    f"📐 Kelly: <b>{kelly_f:.1%}</b> | Признаков: <b>{n_features}</b>\n"
+                    f"⏱ Следующее через: <b>{get_config('RETRAIN_INTERVAL_HRS', 6)}ч</b>"
                 )
                 add_log(f"BUY prec={buy_prec:.1%} | sharpe={wf_sharpe_buy:.2f} | Kelly={kelly_f:.1%}")
-                from auto_trainer import _git_push_if_better
-                _git_push_if_better(result)
+                try:
+                    from auto_trainer import _git_push_if_better
+                    _git_push_if_better(result)
+                except Exception:
+                    pass
             else:
                 add_log(f"[Retrainer] Неудача: {result.get('error')}")
                 logger.warning(f"[Retrainer] Неудача: {result.get('error')}")
         except Exception as e:
             logger.error(f"[Retrainer] Ошибка: {e}", exc_info=True)
-            # При ошибке — повтор через 2 часа, не ждём 24ч
             time.sleep(2 * 60 * 60)
             continue
 
-        time.sleep(24 * 60 * 60)
+        interval_hrs = get_config("RETRAIN_INTERVAL_HRS", 6)
+        logger.info(f"[Retrainer] Следующее переобучение через {interval_hrs}ч")
+        time.sleep(interval_hrs * 3600)
 
 
 # ═══════════════════════════════════════════
-# БЭКТЕСТ (каждые 12 часов)
+# БЭКТЕСТ (12ч)
 # ═══════════════════════════════════════════
 def backtest_loop():
     time.sleep(120)
-
     while True:
         try:
             result = run_backtest(symbol=SYMBOL)
-            msg    = format_backtest_message(result)
-            send_message(msg)
+            send_message(format_backtest_message(result))
         except Exception as e:
             logger.error(f"[Backtest] Ошибка: {e}", exc_info=True)
-
         time.sleep(12 * 60 * 60)
 
 
@@ -380,16 +372,15 @@ def backtest_loop():
 # ═══════════════════════════════════════════
 def stats_loop():
     time.sleep(300)
-
     while True:
         try:
             stats = get_stats()
             send_message(format_stats_message(stats))
+            if SIGNAL_LOGGER_OK:
+                send_message(daily_report_message())
         except Exception as e:
             logger.error(f"[Stats] Ошибка: {e}")
-
         time.sleep(24 * 60 * 60)
-
 
 
 def advisor_loop():
@@ -401,6 +392,7 @@ def advisor_loop():
             logger.error(f"[Advisor] Ошибка: {e}")
         time.sleep(6 * 60 * 60)
 
+
 # ═══════════════════════════════════════════
 # ТОЧКА ВХОДА
 # ═══════════════════════════════════════════
@@ -411,44 +403,28 @@ if __name__ == "__main__":
         exit(1)
 
     n_features = _get_feature_count()
-    logger.info(f"✅ Конфиг OK | Признаков: {n_features} | Запускаем TradeBot v8.0...")
+    logger.info(f"✅ Конфиг OK | Признаков: {n_features} | Запускаем TradeBot v8.3 BTC...")
 
-    threading.Thread(target=run_health_server, daemon=True).start()
-    threading.Thread(target=retrainer_loop,    daemon=True).start()
-    threading.Thread(target=trading_loop,      daemon=True).start()
-    threading.Thread(target=backtest_loop,     daemon=True).start()
-    threading.Thread(target=stats_loop,        daemon=True).start()
-    threading.Thread(target=advisor_loop,      daemon=True).start()
+    threading.Thread(target=run_health_server,    daemon=True).start()
+    threading.Thread(target=retrainer_loop,       daemon=True).start()
+    threading.Thread(target=trading_loop,         daemon=True).start()
+    threading.Thread(target=backtest_loop,        daemon=True).start()
+    threading.Thread(target=stats_loop,           daemon=True).start()
+    threading.Thread(target=advisor_loop,         daemon=True).start()
+    if SIGNAL_LOGGER_OK:
+        threading.Thread(target=outcome_checker_loop, daemon=True).start()
 
-    lunarcrush_status = "✅ Активен" if os.getenv("LUNARCRUSH_API_KEY") else "⚠️ Нет ключа (технический fallback)"
+    lunarcrush_status = "✅ Активен" if os.getenv("LUNARCRUSH_API_KEY") else "⚠️ Нет ключа"
 
     send_message(
-        "🤖 <b>TradeBot v8.0 запущен!</b>\n\n"
-        f"📊 Пара:              <b>{SYMBOL}</b>\n"
-        f"⏱ Интервал:          <b>{SIGNAL_INTERVAL_MINUTES} мин</b>\n"
-        f"🎯 Мин. уверенность: <b>{MIN_CONFIDENCE:.0%}</b>\n\n"
-        f"🔬 <b>Архитектура v7.0:</b>\n"
-        f"   🟢 BUY-модель:    XGB + LGBM (бинарный)\n"
-        f"   🔴 SELL-модель:   XGB + LGBM (бинарный)\n"
-        f"   🏗️ Stacking:     LogReg поверх XGB+LGBM\n"
-        f"   🏷 Разметка:      Triple Barrier Method\n"
-        f"   🧩 Meta-filter:   OOF (без leakage)\n"
-        f"   ✂️ Pruning:       Feature Importance ≥ 0.5%\n"
-        f"   ⚗️ SMOTE:         балансировка 1:1\n"
-        f"   🔬 Optuna:        30 trials гиперпараметров\n"
-        f"   📊 Перцентиль:    топ-35% сигналов\n"
-        f"   📐 Multi-TF:      1H сигнал + 4H фильтр\n"
-        f"   ₿  BTC macro:     активен (-4% блок)\n"
-        f"   🌊 Hurst:         детектор режима рынка\n"
-        f"   💹 VWAP:          институциональная цена\n"
-        f"   📐 Realized Vol:  точная волатильность\n"
-        f"   💹 ADX фильтр:    > 18 (нет сделок в боковике)\n"
-        f"   🔄 Trailing SL:   +1.0% breakeven / +1.5% trail\n"
-        f"   📐 Kelly (Half):  динамический размер позиции\n"
-        f"   🛡 Loss Penalty:  -15% Kelly на каждый стоп подряд\n"
-        f"   🚫 DrawDown Guard: блок при просадке > 20%\n"
-        f"   🌐 Sentiment:     LunarCrush — {lunarcrush_status}\n"
-        f"   🔢 Признаков:     <b>{n_features}</b>"
+        f"🤖 <b>TradeBot v8.3 BTC запущен!</b>\n\n"
+        f"📊 Пара: <b>{SYMBOL}</b>\n"
+        f"⏱ Интервал: <b>{SIGNAL_INTERVAL_MINUTES} мин</b>\n"
+        f"🎯 Мин. уверенность: <b>{MIN_CONFIDENCE:.0%}</b>\n"
+        f"🔁 Переобучение: <b>каждые {get_config('RETRAIN_INTERVAL_HRS',6)}ч</b>\n"
+        f"📝 Signal Logger: <b>{'✅ Активен' if SIGNAL_LOGGER_OK else '❌ Не загружен'}</b>\n"
+        f"🌐 Sentiment: <b>{lunarcrush_status}</b>\n"
+        f"🔢 Признаков: <b>{n_features}</b>"
     )
 
     while True:

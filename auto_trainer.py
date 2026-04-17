@@ -30,12 +30,6 @@ import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from xgboost import XGBClassifier
-try:
-    from catboost import CatBoostClassifier
-    CATBOOST_AVAILABLE = True
-except ImportError:
-    CATBOOST_AVAILABLE = False
-from sklearn.linear_model import RidgeClassifierCV
 from sklearn.metrics import (
     accuracy_score, precision_score,
     recall_score, f1_score, roc_auc_score,
@@ -101,6 +95,35 @@ def fetch_ohlcv(symbol: str = "TON-USDT", bar: str = "1H", bars: int = 8000) -> 
     except Exception as e:
         logger.error(f"[Trainer] Ошибка загрузки {bar}: {e}")
         return pd.DataFrame()
+
+# ─────────────────────────────────────────────
+# Funding Rate + Open Interest (исторические данные)
+# ─────────────────────────────────────────────
+def fetch_funding_history(symbol: str = "BTC-USDT-SWAP", limit: int = 100) -> "pd.DataFrame":
+    try:
+        import requests as _req
+        url = f"https://www.okx.com/api/v5/public/funding-rate-history?instId={symbol}&limit=100"
+        r = _req.get(url, timeout=10)
+        data = r.json().get("data", [])
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = int(d.get("fundingTime", 0))
+            fr = float(d.get("fundingRate", 0.0))
+            rows.append({"ts": ts, "Funding_rate": fr})
+        df = pd.DataFrame(rows)
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        df.set_index("ts", inplace=True)
+        df.sort_index(inplace=True)
+        df = df.resample("1h").ffill()
+        logger.info(f"[Trainer] Funding Rate: {len(df)} записей")
+        return df
+    except Exception as e:
+        logger.warning(f"[Trainer] Funding недоступен: {e}")
+        return pd.DataFrame()
+
+
 
 
 # ─────────────────────────────────────────────
@@ -296,6 +319,18 @@ def calc_indicators_1h(df: pd.DataFrame) -> pd.DataFrame:
     d['OFI'] = calc_order_flow_imbalance(d)
 
     d['Price_accel'] = close.pct_change(1) - close.pct_change(1).shift(1)
+    try:
+        fund_df = fetch_funding_history()
+        if not fund_df.empty:
+            d["Funding_rate"] = fund_df["Funding_rate"].reindex(d.index, method="ffill").fillna(0.0)
+            d["Funding_bias"] = d["Funding_rate"].apply(lambda x: 1.0 if x > 0.0001 else (-1.0 if x < -0.0001 else 0.0))
+        else:
+            d["Funding_rate"] = 0.0
+            d["Funding_bias"] = 0.0
+    except Exception:
+        d["Funding_rate"] = 0.0
+        d["Funding_bias"] = 0.0
+
 
     log_ret = np.log(close / close.shift(1))
     d['Vol_cluster'] = (log_ret**2).ewm(span=5).mean() / ((log_ret**2).ewm(span=20).mean() + 1e-9)
@@ -438,13 +473,6 @@ def triple_barrier_labels(df: pd.DataFrame,
     df = df.copy()
     df['Target_BUY']  = target_buy
     df['Target_SELL'] = target_sell
-    # HOLD: цена не вышла ни за TP ни за SL — боковик
-    target_hold = np.where(
-        np.isnan(target_buy) & np.isnan(target_sell), 1,
-        np.where((target_buy == 0) & (target_sell == 0), 1, 0)
-    ).astype(float)
-    target_hold[n - horizon:] = np.nan
-    df['Target_HOLD'] = target_hold
 
     total     = n - horizon
     buy_valid = int(np.sum(~np.isnan(target_buy[:total])))
@@ -651,37 +679,6 @@ def train_binary_lgbm(X_train, y_train, X_test, y_test) -> tuple:
     }
     return model, metrics
 
-# v8.1: CatBoost base learner
-def train_binary_cat(X_train, y_train, X_test, y_test) -> tuple:
-    if not CATBOOST_AVAILABLE:
-        return None, None
-    pos_count = y_train.sum()
-    neg_count = len(y_train) - pos_count
-    scale_pos = neg_count / (pos_count + 1e-9)
-    model = CatBoostClassifier(
-        iterations=400, depth=4, learning_rate=0.03,
-        l2_leaf_reg=3.0, subsample=0.75,
-        scale_pos_weight=min(scale_pos, 5.0),
-        eval_metric="AUC", verbose=0,
-        early_stopping_rounds=50,
-    )
-    model.fit(
-        X_train, y_train,
-        eval_set=(X_test, y_test),
-        use_best_model=True,
-    )
-    y_pred  = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
-    metrics = {
-        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
-        "recall":    float(recall_score(y_test, y_pred, zero_division=0)),
-        "f1":        float(f1_score(y_test, y_pred, zero_division=0)),
-        "accuracy":  float(accuracy_score(y_test, y_pred)),
-        "roc_auc":   float(roc_auc_score(y_test, y_proba)) if y_test.sum() > 0 else 0.0,
-    }
-    return model, metrics
-
-
 
 # ─────────────────────────────────────────────
 # v8.0 NEW: КАЛИБРОВКА ВЕРОЯТНОСТЕЙ
@@ -763,12 +760,11 @@ def train_stacking_ensemble(
     model_xgb, model_lgbm,
     X_train: np.ndarray, y_train: np.ndarray,
     X_test: np.ndarray, y_test: np.ndarray,
-    label: str = "BUY",
-    model_cat=None
+    label: str = "BUY"
 ) -> tuple:
     """
-    Stacking: XGB + LGBM + CatBoost → RidgeCV (meta-learner).
-    v8.1: CatBoost как 3-й base learner + RidgeCV meta.
+    Stacking: XGB + LGBM → LogisticRegression (meta-learner).
+    v8.0: meta-learner тоже калиброван.
     """
     if not LGBM_AVAILABLE or model_lgbm is None:
         return None, None
@@ -777,19 +773,17 @@ def train_stacking_ensemble(
         p_xgb  = model_xgb.predict_proba(X_test)[:, 1].reshape(-1, 1)
         p_lgbm = model_lgbm.predict_proba(X_test)[:, 1].reshape(-1, 1)
 
-        p_cat  = model_cat.predict_proba(X_test)[:, 1].reshape(-1, 1) if (CATBOOST_AVAILABLE and model_cat is not None) else p_xgb
-        p_avg  = ((p_xgb + p_lgbm + p_cat) / 3)
+        p_avg  = ((p_xgb + p_lgbm) / 2)
         p_diff = (p_xgb - p_lgbm)
-        X_stack_test = np.hstack([p_xgb, p_lgbm, p_cat, p_avg, p_diff])
+        X_stack_test = np.hstack([p_xgb, p_lgbm, p_avg, p_diff])
 
         from sklearn.model_selection import StratifiedKFold
         n_splits = 5
         skf = StratifiedKFold(n_splits=n_splits, shuffle=False)
 
         p_xgb_oof  = np.zeros(len(X_train))
-        p_xgb_oof  = np.zeros(len(X_train))
         p_lgbm_oof = np.zeros(len(X_train))
-        p_cat_oof  = np.zeros(len(X_train))
+
         for fold, (tr_idx, val_idx) in enumerate(skf.split(X_train, y_train)):
             X_tr, X_val = X_train[tr_idx], X_train[val_idx]
             y_tr, y_val_fold = y_train[tr_idx], y_train[val_idx]
@@ -811,30 +805,22 @@ def train_stacking_ensemble(
                 )
                 lgbm_fold.fit(X_tr, y_tr)
                 p_lgbm_oof[val_idx] = lgbm_fold.predict_proba(X_val)[:, 1]
-            if CATBOOST_AVAILABLE:
-                cat_fold = CatBoostClassifier(
-                    iterations=200, depth=4, learning_rate=0.05,
-                    verbose=0, random_seed=42
-                )
-                cat_fold.fit(X_tr, y_tr)
-                p_cat_oof[val_idx] = cat_fold.predict_proba(X_val)[:, 1]
 
-        p_avg_oof  = (p_xgb_oof + p_lgbm_oof + p_cat_oof) / 3
+        p_avg_oof  = (p_xgb_oof + p_lgbm_oof) / 2
         p_diff_oof = p_xgb_oof - p_lgbm_oof
         X_stack_train = np.column_stack([
-            p_xgb_oof, p_lgbm_oof, p_cat_oof, p_avg_oof, p_diff_oof
+            p_xgb_oof, p_lgbm_oof, p_avg_oof, p_diff_oof
         ])
 
         scaler   = StandardScaler()
         X_st_tr  = scaler.fit_transform(X_stack_train)
         X_st_te  = scaler.transform(X_stack_test)
 
-        stack_model = RidgeClassifierCV(alphas=[0.01, 0.1, 1.0, 10.0], cv=5)
+        stack_model = LogisticRegression(C=1.0, max_iter=500, random_state=42)
         stack_model.fit(X_st_tr, y_train)
 
         y_pred  = stack_model.predict(X_st_te)
-        d = stack_model.decision_function(X_st_te)
-        y_proba = 1 / (1 + np.exp(-d))
+        y_proba = stack_model.predict_proba(X_st_te)[:, 1]
         metrics = {
             'precision': float(precision_score(y_test, y_pred, zero_division=0)),
             'recall':    float(recall_score(y_test, y_pred, zero_division=0)),
@@ -1168,10 +1154,6 @@ def train_model() -> dict:
 
     logger.info("[Trainer] 🔧 LightGBM BUY...")
     buy_lgbm, buy_lgbm_m = train_binary_lgbm(X_buy_sm, y_buy_sm, X_buy_test, y_buy_test)
-    logger.info("[Trainer] 🔧 CatBoost BUY...")
-    buy_cat, buy_cat_m = train_binary_cat(X_buy_sm, y_buy_sm, X_buy_test, y_buy_test)
-    if buy_cat_m:
-        logger.info(f"[Trainer] BUY CAT: prec={buy_cat_m['precision']:.1%} auc={buy_cat_m['roc_auc']:.3f}")
     if buy_lgbm_m:
         logger.info(f"[Trainer] BUY LGBM: prec={buy_lgbm_m['precision']:.1%} auc={buy_lgbm_m['roc_auc']:.3f}")
 
@@ -1181,10 +1163,6 @@ def train_model() -> dict:
 
     logger.info("[Trainer] 🔧 LightGBM SELL...")
     sell_lgbm, sell_lgbm_m = train_binary_lgbm(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test)
-    logger.info("[Trainer] 🔧 CatBoost SELL...")
-    sell_cat, sell_cat_m = train_binary_cat(X_sell_sm, y_sell_sm, X_sell_test, y_sell_test)
-    if sell_cat_m:
-        logger.info(f"[Trainer] SELL CAT: prec={sell_cat_m['precision']:.1%} auc={sell_cat_m['roc_auc']:.3f}")
 
     # 11. FEATURE PRUNING
     logger.info("[Trainer] ✂️ Feature Importance Pruning...")
@@ -1219,12 +1197,12 @@ def train_model() -> dict:
     # 12. STACKING
     logger.info("[Trainer] 🏗️ Stacking BUY...")
     stack_buy, stack_buy_m = train_stacking_ensemble(
-        buy_xgb, buy_lgbm, X_buy_train, y_buy_train, X_buy_test, y_buy_test, "BUY", model_cat=buy_cat
+        buy_xgb, buy_lgbm, X_buy_train, y_buy_train, X_buy_test, y_buy_test, "BUY"
     )
 
     logger.info("[Trainer] 🏗️ Stacking SELL...")
     stack_sell, stack_sell_m = train_stacking_ensemble(
-        sell_xgb, sell_lgbm, X_sell_train, y_sell_train, X_sell_test, y_sell_test, "SELL", model_cat=sell_cat
+        sell_xgb, sell_lgbm, X_sell_train, y_sell_train, X_sell_test, y_sell_test, "SELL"
     )
 
     # 13. META-LABELING

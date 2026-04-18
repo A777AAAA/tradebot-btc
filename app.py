@@ -1,5 +1,5 @@
 """
-TradeBot v8.0 — Калибровка + 8000 свечей + Triple Barrier + Kelly + Drawdown Guard
+TradeBot v8.3 — XGB+LGBM+CatBoost+RidgeCV+Calibrated+signal_logger
 v7.0 изменения vs v6.0:
   - Stacking ансамбль (LogReg поверх XGB+LGBM) — лучшая калибровка
   - Feature Pruning — автоотсев шумовых признаков

@@ -178,6 +178,12 @@ def trading_loop():
                 + (f" | meta={p_meta:.1%}" if p_meta is not None else "")
             )
             add_log(f"Signal v8.0] {signal} | p_buy={p_buy:.1%} p_sell={p_sell:.1%} | ADX={adx:.1f} | Hurst={hurst:.3f} | Regime={regime}")
+            try:
+                import signal_logger
+                p_hold = signal_data.get('p_hold', 0.0)
+                signal_logger.log_signal(PAPER_SYMBOL, signal, price, confidence, p_buy, p_sell, p_hold)
+            except Exception as _e:
+                logger.warning(f'[signal_logger] {_e}')
 
             # Открытие сделки
             if signal in ("BUY", "SELL") and confidence >= get_config("MIN_CONFIDENCE", 0.52):

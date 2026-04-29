@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_PATH_BUY_XGB   = "model_buy_xgb.pkl"
 MODEL_PATH_SELL_XGB  = "model_sell_xgb.pkl"
-MODEL_FEATURES_PATH  = "model_features.json"
+MODEL_FEATURES_PATH  = "/app/data/model_features.json"
 META_MODEL_BUY_PATH  = "meta_model_buy.pkl"
 META_MODEL_SELL_PATH = "meta_model_sell.pkl"
 

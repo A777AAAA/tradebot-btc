@@ -161,15 +161,19 @@ def save_trades(trades: list):
 # ─────────────────────────────────────────────
 def get_current_price(symbol: str = "BTC/USDT") -> float:
     try:
-        coin = symbol.split("/")[0].lower()
-        coin_id = {"btc": "bitcoin", "eth": "ethereum", "ton": "the-open-network"}.get(coin, coin)
-        r = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd", timeout=10)
-        price = r.json().get(coin_id, {}).get("usd", 0.0)
-        if price > 0:
-            return float(price)
-        # fallback CryptoCompare
-        r2 = requests.get(f"https://min-api.cryptocompare.com/data/price?fsym={coin.upper()}&tsyms=USD", timeout=10)
-        return float(r2.json().get("USD", 0.0))
+        sym = symbol.upper()
+        if "BTC" in sym:
+            cg_id = "bitcoin"
+        elif "TON" in sym:
+            cg_id = "the-open-network"
+        else:
+            cg_id = sym.split("/")[0].lower()
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd",
+            timeout=10
+        )
+        price = r.json()[cg_id]["usd"]
+        return float(price)
     except Exception as e:
         logger.error(f"[Paper] ❌ Ошибка цены: {e}")
         return 0.0
